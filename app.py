@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 from heartbeat_preprocessor.core import (
@@ -67,7 +68,7 @@ def sidebar_params() -> ProcessingParams:
     )
 
 
-def render_result(result: dict) -> None:
+def render_result(result: dict, save_outputs: bool) -> dict | None:
     summary = result["summary"]
     tempo = summary["tempo"]
     loop = summary["best_loop"]
@@ -165,6 +166,60 @@ def render_result(result: dict) -> None:
         st.dataframe(result["loop_candidates"], use_container_width=True)
         st.dataframe(result["template_analysis"], use_container_width=True)
 
+    with st.expander("Manual beat and loop correction"):
+        st.caption("Edit beat times in seconds, then optionally set an exact loop range. The exports will be regenerated.")
+        if "input_data" not in result or "params" not in result:
+            st.warning("This result was created before manual correction was available. Process the input again first.")
+            return None
+        revision = result.get("_ui_revision", 0)
+        key_prefix = f"{result['stem']}_{revision}"
+        edited_beats = st.data_editor(
+            pd.DataFrame({"time_seconds": result["beat_times"]}),
+            num_rows="dynamic",
+            use_container_width=True,
+            key=f"{key_prefix}_manual_beats",
+        )
+        loop_cols = st.columns(2)
+        manual_start = loop_cols[0].number_input(
+            "Manual loop start (seconds)",
+            min_value=0.0,
+            max_value=float(summary["duration_seconds"]),
+            value=float(loop["start_seconds"]),
+            step=0.01,
+            key=f"{key_prefix}_manual_loop_start",
+        )
+        manual_end = loop_cols[1].number_input(
+            "Manual loop end (seconds)",
+            min_value=0.0,
+            max_value=float(summary["duration_seconds"]),
+            value=float(loop["end_seconds"]),
+            step=0.01,
+            key=f"{key_prefix}_manual_loop_end",
+        )
+        action_cols = st.columns(2)
+        apply_changes = action_cols[0].button("Apply manual corrections", key=f"{key_prefix}_apply")
+        reset_changes = action_cols[1].button("Restore automatic analysis", key=f"{key_prefix}_reset")
+        if reset_changes:
+            updated = process_audio_bytes(result["name"], result["input_data"], params=result["params"])
+        elif apply_changes:
+            manual_times = pd.to_numeric(edited_beats["time_seconds"], errors="coerce").dropna().to_numpy()
+            updated = process_audio_bytes(
+                result["name"],
+                result["input_data"],
+                params=result["params"],
+                manual_beat_times=manual_times,
+                manual_loop_range=(float(manual_start), float(manual_end)),
+            )
+        else:
+            return None
+        updated["_ui_revision"] = revision + 1
+        if save_outputs:
+            output_root = Path("outputs") / "manual_corrections" / datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_result_to_dir(updated, output_root)
+        return updated
+
+    return None
+
 
 def main() -> None:
     st.title("LegaSynth Heartbeat Audio Analysis")
@@ -213,9 +268,13 @@ def main() -> None:
             file_name="legasynth_heartbeat_batch_outputs.zip",
             mime="application/zip",
         )
-        for result in results:
+        for index, result in enumerate(results):
             with st.expander(result["name"], expanded=len(results) == 1):
-                render_result(result)
+                updated = render_result(result, save_outputs)
+                if updated is not None:
+                    results[index] = updated
+                    st.session_state["results"] = results
+                    st.rerun()
 
 
 if __name__ == "__main__":

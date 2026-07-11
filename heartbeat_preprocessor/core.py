@@ -72,7 +72,11 @@ def process_wav_file(path: str | os.PathLike[str], params: ProcessingParams | No
 
 
 def process_audio_bytes(
-    filename: str, data: bytes, params: ProcessingParams | None = None
+    filename: str,
+    data: bytes,
+    params: ProcessingParams | None = None,
+    manual_beat_times: np.ndarray | list[float] | None = None,
+    manual_loop_range: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     params = params or ProcessingParams()
     sr, raw, source_info = read_audio_bytes(filename, data)
@@ -94,16 +98,38 @@ def process_audio_bytes(
     beat_times, template_info, template_analysis, template_waveform = confirm_beats_with_template(
         filtered, candidate_beat_times, sr, bpm_info["period_seconds"], params
     )
+    normalized_manual_beats = normalize_manual_beat_times(manual_beat_times, duration)
+    if normalized_manual_beats is not None:
+        beat_times = normalized_manual_beats
+        template_info = {
+            **template_info,
+            "confirmed_count": int(len(beat_times)),
+            "confirmation_fraction": float(len(beat_times) / len(candidate_beat_times))
+            if len(candidate_beat_times)
+            else 0.0,
+            "method": "manual_beat_times",
+        }
     ibi = np.diff(beat_times)
-    loop_info, loop_candidates = rank_loop_candidates(
-        beat_times,
-        envelope,
-        sr,
-        duration,
-        params.target_loop_beats,
-        bpm_info["period_seconds"],
-        params.loop_candidate_count,
-    )
+    manual_loop = normalize_manual_loop_range(manual_loop_range, duration)
+    if manual_loop is not None:
+        loop_info = make_manual_loop_info(beat_times, manual_loop)
+        loop_candidates = [{**loop_info, "rank": 1}]
+    else:
+        loop_info, loop_candidates = rank_loop_candidates(
+            beat_times,
+            envelope,
+            sr,
+            duration,
+            params.target_loop_beats,
+            bpm_info["period_seconds"],
+            params.loop_candidate_count,
+        )
+    manual_corrections = {
+        "beat_times_overridden": normalized_manual_beats is not None,
+        "loop_range_overridden": manual_loop is not None,
+        "manual_beat_count": int(len(normalized_manual_beats)) if normalized_manual_beats is not None else None,
+        "manual_loop_range_seconds": list(manual_loop) if manual_loop is not None else None,
+    }
     cleaned = apply_beat_synchronous_gate(filtered, sr, beat_times, params)
     loop_audio, loop_audio_info = cut_loop(cleaned, sr, loop_info, params)
 
@@ -128,6 +154,7 @@ def process_audio_bytes(
         ibi=ibi,
         loop_info={**loop_info, **loop_audio_info},
         template_info=template_info,
+        manual_corrections=manual_corrections,
         params=params,
     )
 
@@ -170,6 +197,7 @@ def process_audio_bytes(
         "loop_candidates.csv": loop_candidates_df.to_csv(index=False).encode("utf-8"),
         "template_analysis.csv": template_analysis_df.to_csv(index=False).encode("utf-8"),
         "heartbeat_template.csv": template_waveform_df.to_csv(index=False).encode("utf-8"),
+        "manual_corrections.json": json.dumps(manual_corrections, indent=2).encode("utf-8"),
         "recording_quality.json": json.dumps(recording_quality, indent=2).encode("utf-8"),
         "cleaned.wav": wav_bytes(sr, cleaned_audio),
         "filtered_detection.wav": wav_bytes(sr, filtered_audio),
@@ -179,8 +207,10 @@ def process_audio_bytes(
 
     return {
         "name": filename,
+        "input_data": data,
         "stem": stem,
         "sample_rate": sr,
+        "params": params,
         "raw": mono,
         "cleaned": cleaned_audio,
         "filtered": filtered_audio,
@@ -242,7 +272,9 @@ def make_markdown_report(summary: dict[str, Any]) -> str:
         f"- Beats: {loop['num_beats']}",
         f"- Local BPM: {loop['local_bpm']:.3f}",
         f"- Regularity score: {loop['regularity_score']}",
-        f"- Loop quality score: {loop['quality_score']:.1f}/100",
+        f"- Loop quality score: {format_optional_score(loop['quality_score'])}",
+        f"- Manual beat correction: {summary['manual_corrections']['beat_times_overridden']}",
+        f"- Manual loop correction: {summary['manual_corrections']['loop_range_overridden']}",
         "",
         "## Processing Parameters",
     ]
@@ -676,6 +708,51 @@ def _template_info(
     }
 
 
+def normalize_manual_beat_times(
+    manual_beat_times: np.ndarray | list[float] | None, duration: float
+) -> np.ndarray | None:
+    if manual_beat_times is None:
+        return None
+    values = np.asarray(manual_beat_times, dtype=np.float64).reshape(-1)
+    values = values[np.isfinite(values)]
+    values = np.unique(np.round(values[(values >= 0.0) & (values <= duration)], decimals=6))
+    if len(values) < 2:
+        raise ValueError("Manual beat correction must contain at least two valid times within the recording duration.")
+    return values.astype(np.float32)
+
+
+def normalize_manual_loop_range(
+    manual_loop_range: tuple[float, float] | None, duration: float
+) -> tuple[float, float] | None:
+    if manual_loop_range is None:
+        return None
+    start, end = (float(manual_loop_range[0]), float(manual_loop_range[1]))
+    start = float(np.clip(start, 0.0, duration))
+    end = float(np.clip(end, 0.0, duration))
+    if end - start < 0.1:
+        raise ValueError("Manual loop end must be at least 0.1 seconds after its start.")
+    return start, end
+
+
+def make_manual_loop_info(beat_times: np.ndarray, loop_range: tuple[float, float]) -> dict[str, Any]:
+    start, end = loop_range
+    in_loop = np.asarray(beat_times)[(np.asarray(beat_times) >= start) & (np.asarray(beat_times) <= end)]
+    intervals = np.diff(in_loop)
+    local_bpm = float(60.0 / np.median(intervals)) if len(intervals) else 0.0
+    return {
+        "start_seconds": start,
+        "end_seconds": end,
+        "duration_seconds": end - start,
+        "num_beats": int(len(in_loop)),
+        "local_bpm": local_bpm,
+        "ibi_std_seconds": float(np.std(intervals)) if len(intervals) else None,
+        "regularity_score": float(np.std(intervals) / (np.mean(intervals) + 1e-9)) if len(intervals) else None,
+        "envelope_snr_db": None,
+        "quality_score": None,
+        "method": "manual_loop_range",
+    }
+
+
 def choose_best_loop(
     beat_times: np.ndarray, duration: float, target_loop_beats: int, fallback_period: float
 ) -> dict[str, Any]:
@@ -958,6 +1035,7 @@ def build_summary(
     ibi: np.ndarray,
     loop_info: dict[str, Any],
     template_info: dict[str, Any],
+    manual_corrections: dict[str, Any],
     params: ProcessingParams,
 ) -> dict[str, Any]:
     return {
@@ -982,12 +1060,17 @@ def build_summary(
         },
         "template_confirmation": template_info,
         "best_loop": loop_info,
+        "manual_corrections": manual_corrections,
         "parameters": asdict(params),
     }
 
 
 def dbfs(value: float) -> float:
     return float(20.0 * math.log10(max(value, 1e-12)))
+
+
+def format_optional_score(value: float | None) -> str:
+    return "manual selection" if value is None else f"{value:.1f}/100"
 
 
 def normalize_for_wav(x: np.ndarray, target_peak: float = 0.8) -> np.ndarray:

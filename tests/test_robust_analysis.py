@@ -1,11 +1,14 @@
+import io
 import unittest
 
 import numpy as np
+from scipy.io import wavfile
 
 from heartbeat_preprocessor.core import (
     ProcessingParams,
     confirm_beats_with_template,
     estimate_bpm_with_consensus,
+    process_audio_bytes,
     rank_loop_candidates,
 )
 
@@ -66,6 +69,24 @@ class RobustAnalysisTest(unittest.TestCase):
         self.assertEqual(info["method"], "kept_timing_complete")
         self.assertEqual(len(analysis), len(beats))
         self.assertGreater(len(template), 0)
+
+    def test_manual_beats_and_loop_regenerate_outputs(self) -> None:
+        sample_rate = 8000
+        signal_data = np.zeros(sample_rate * 5, dtype=np.float32)
+        buffer = io.BytesIO()
+        wavfile.write(buffer, sample_rate, (signal_data * 32767).astype(np.int16))
+        manual_beats = [0.5, 1.3, 2.1, 2.9, 3.7]
+        result = process_audio_bytes(
+            "manual_test.wav",
+            buffer.getvalue(),
+            manual_beat_times=manual_beats,
+            manual_loop_range=(0.5, 3.7),
+        )
+        self.assertEqual(result["summary"]["tempo"]["detected_beats"], len(manual_beats))
+        self.assertTrue(result["summary"]["manual_corrections"]["beat_times_overridden"])
+        self.assertTrue(result["summary"]["manual_corrections"]["loop_range_overridden"])
+        self.assertEqual(result["summary"]["best_loop"]["method"], "manual_loop_range")
+        self.assertIn("manual_corrections.json", result["artifacts"])
 
 
 if __name__ == "__main__":

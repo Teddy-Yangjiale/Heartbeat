@@ -284,6 +284,10 @@ conda run -n heartbeat python scripts\process_files.py "C:\path\heartbeat.wav" -
 
 模板确认的可解释数据。`heartbeat_template.csv` 是由候选心拍中位数得到的归一化波形；`template_analysis.csv` 给出每个候选的相关性、是否匹配模板、是否最终保留和决定原因。为避免漏拍，只有候选数明显高于 BPM 预期时，模板才会删除不匹配的峰；否则只记录相似度并保留节拍序列。
 
+### `manual_corrections.json`
+
+记录是否在 Web App 中人工修改了 beat 时间或 loop 起止时间。展开每个处理结果的 `Manual beat and loop correction` 后，可直接在表格中增删/编辑以秒为单位的 beat，再指定 loop 起止时间并点击应用。系统会重新运行导出链路；`Restore automatic analysis` 会恢复自动结果。
+
 每个输入音频会生成以下文件。
 
 ### `tempo_summary.json`
