@@ -9,3 +9,4 @@ pydub
 librosa
 soundfile
 imageio-ffmpeg
+edge-tts

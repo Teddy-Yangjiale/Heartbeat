@@ -11,6 +11,7 @@ from typing import Any
 import pandas as pd
 
 from heartbeat_preprocessor.core import ProcessingParams, process_wav_file, safe_stem, save_result_to_dir
+from legasynth.emotion import analyze_emotion, save_emotion_report
 from legasynth.mixing import mix_heartbeat_with_song
 from legasynth.video_audio import prepare_video_audio
 from legasynth.video_render import render_heartbeat_video
@@ -54,6 +55,11 @@ def process_one(
     effect_strength: float = 0.75,
     duration_limit: float | None = None,
     title_text: str = "",
+    enable_emotion: bool = True,
+    enable_beat_editing: bool = True,
+    show_overlay: bool = False,
+    enable_subtitles: bool = True,
+    chinese_cover_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     params = params or ProcessingParams()
     heartbeat_path = Path(heartbeat_path)
@@ -81,10 +87,35 @@ def process_one(
         flat_pre.rename(pre_dir)
     heartbeat_summary = pre_result["summary"]
 
+    # Feature A: emotion / affect analysis and visual style profile from the heartbeat.
+    emotion_report = analyze_emotion(heartbeat_summary) if enable_emotion else None
+    style_profile = emotion_report["style_profile"] if emotion_report else None
+    if emotion_report is not None:
+        save_emotion_report(emotion_report, reports_dir)
+
     video_meta = prepare_video_audio(copied_video, song_dir)
     loop_wav = pre_dir / "best_loop.wav"
+
+    # Feature C (optional): sing the song's lyrics in Chinese and replace the vocal.
+    cover_report = None
+    render_source_audio_default = None
+    if chinese_cover_options and chinese_cover_options.get("enabled"):
+        from legasynth.chinese_cover import generate_chinese_cover
+
+        cover_report = generate_chinese_cover(
+            song_wav=video_meta["extracted_audio_path"],
+            out_dir=case_dir / "chinese_cover",
+            **{k: v for k, v in chinese_cover_options.items() if k != "enabled"},
+        )
+        render_source_audio_default = cover_report.get("cover_audio_wav")
+
+    # Karaoke-style Chinese lyric subtitles come from the cover's timed lines.
+    subtitles = None
+    if enable_subtitles and cover_report and cover_report.get("lines"):
+        subtitles = cover_report["lines"]
+
     mix_report = mix_heartbeat_with_song(
-        song_wav=video_meta["extracted_audio_path"],
+        song_wav=render_source_audio_default or video_meta["extracted_audio_path"],
         loop_wav=loop_wav,
         heartbeat_summary=heartbeat_summary,
         song_bpm=float(video_meta["estimated_song_bpm"] or heartbeat_summary["tempo"]["estimated_bpm"]),
@@ -102,6 +133,10 @@ def process_one(
         title_text=title_text,
         effect_strength=effect_strength,
         duration_limit=duration_limit,
+        style_profile=style_profile,
+        show_overlay=show_overlay,
+        enable_beat_editing=enable_beat_editing,
+        subtitles=subtitles,
     )
 
     run_report = {
@@ -109,7 +144,9 @@ def process_one(
         "video_file": str(copied_video),
         "case_dir": str(case_dir),
         "preprocessing": heartbeat_summary,
+        "emotion": emotion_report,
         "video_metadata": video_meta,
+        "chinese_cover": cover_report,
         "mix_report": mix_report,
         "video_report": video_report,
         "outputs": {
@@ -119,7 +156,9 @@ def process_one(
             "all_outputs_zip": str(case_dir / "all_outputs.zip"),
         },
     }
-    (reports_dir / "diagnostic_report.json").write_text(json.dumps(run_report, indent=2), encoding="utf-8")
+    (reports_dir / "diagnostic_report.json").write_text(
+        json.dumps(run_report, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     zip_path = zip_directory(case_dir, case_dir / "all_outputs.zip")
     run_report["outputs"]["all_outputs_zip"] = str(zip_path)
     return run_report

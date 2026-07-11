@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -12,9 +13,10 @@ from heartbeat_preprocessor.core import (
     process_audio_bytes,
     save_result_to_dir,
 )
+from legasynth.pipeline import process_one
 
 
-st.set_page_config(page_title="LegaSynth Heartbeat Audio Analysis", layout="wide")
+st.set_page_config(page_title="LegaSynth Heartbeat Music Video", layout="wide")
 
 
 def sidebar_params() -> ProcessingParams:
@@ -221,24 +223,21 @@ def render_result(result: dict, save_outputs: bool) -> dict | None:
     return None
 
 
-def main() -> None:
-    st.title("LegaSynth Heartbeat Audio Analysis")
-    st.write("Stage 1: upload heartbeat WAV or MP3 files, then export all preprocessing parameters, beat data, loop audio, and diagnostics.")
-
-    params = sidebar_params()
-    save_outputs = st.sidebar.checkbox("Also save outputs to D:\\Heartbeat\\outputs", value=True)
+def stage1_tab(params: ProcessingParams, save_outputs: bool) -> None:
+    st.write("Upload heartbeat WAV or MP3 files, then export all preprocessing parameters, beat data, loop audio, and diagnostics.")
 
     files = st.file_uploader(
         "Upload heartbeat audio files",
         type=["wav", "mp3"],
         accept_multiple_files=True,
+        key="stage1_uploader",
     )
 
     if not files:
         st.info("Drop WAV or MP3 heartbeat recordings here to begin. The app does not require a GPU.")
         return
 
-    if st.button("Process uploaded files", type="primary"):
+    if st.button("Process uploaded files", type="primary", key="stage1_run"):
         results = []
         output_root = Path("outputs") / datetime.now().strftime("%Y%m%d_%H%M%S")
         progress = st.progress(0)
@@ -267,6 +266,7 @@ def main() -> None:
             make_batch_zip(results),
             file_name="legasynth_heartbeat_batch_outputs.zip",
             mime="application/zip",
+            key="stage1_batchzip",
         )
         for index, result in enumerate(results):
             with st.expander(result["name"], expanded=len(results) == 1):
@@ -275,6 +275,221 @@ def main() -> None:
                     results[index] = updated
                     st.session_state["results"] = results
                     st.rerun()
+
+
+# =====================================================================================
+# Full pipeline: heartbeat-inspired music video (Features A + B + C)
+# =====================================================================================
+
+def _read_bytes(path: str | None) -> bytes | None:
+    if not path:
+        return None
+    p = Path(path)
+    return p.read_bytes() if p.exists() else None
+
+
+def run_full_pipeline(
+    heartbeat_files,
+    video_file,
+    params: ProcessingParams,
+    effect_strength: float,
+    heartbeat_gain_db: float,
+    title_text: str,
+    enable_emotion: bool,
+    enable_beat_editing: bool,
+    show_overlay: bool,
+    enable_subtitles: bool,
+    duration_limit: float | None,
+    cover_options: dict | None,
+) -> list[dict]:
+    reports: list[dict] = []
+    run_root = Path("outputs") / ("mv_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+    tmp_dir = Path(tempfile.mkdtemp(prefix="legasynth_mv_"))
+    video_path = tmp_dir / video_file.name
+    video_path.write_bytes(video_file.getvalue())
+
+    progress = st.progress(0.0)
+    status = st.empty()
+    for i, hb in enumerate(heartbeat_files):
+        status.write(
+            f"Processing {hb.name} ({i + 1}/{len(heartbeat_files)}) — "
+            "heartbeat analysis, mixing, styling, encode"
+            + (", plus online Chinese singing" if cover_options else "")
+            + "…"
+        )
+        hb_path = tmp_dir / hb.name
+        hb_path.write_bytes(hb.getvalue())
+        try:
+            report = process_one(
+                heartbeat_path=hb_path,
+                video_path=video_path,
+                out_root=run_root,
+                params=params,
+                heartbeat_gain_db=heartbeat_gain_db,
+                effect_strength=effect_strength,
+                duration_limit=duration_limit,
+                title_text=title_text,
+                enable_emotion=enable_emotion,
+                enable_beat_editing=enable_beat_editing,
+                show_overlay=show_overlay,
+                enable_subtitles=enable_subtitles,
+                chinese_cover_options=cover_options,
+            )
+            reports.append(report)
+        except Exception as exc:
+            st.error(f"Failed to process {hb.name}: {exc}")
+        progress.progress((i + 1) / len(heartbeat_files))
+    status.write(f"Done. Outputs saved under {run_root.resolve()}")
+    return reports
+
+
+def render_pipeline_report(report: dict) -> None:
+    st.subheader(Path(report["heartbeat_file"]).name)
+
+    emotion = report.get("emotion")
+    if emotion:
+        affect = emotion["affect"]
+        style = emotion["style_profile"]
+        cols = st.columns(5)
+        cols[0].metric("Mood", emotion["mood_zh"])
+        cols[1].metric("Valence", f"{affect['valence']:.2f}")
+        cols[2].metric("Arousal", f"{affect['arousal']:.2f}")
+        cols[3].metric("Mean HR", f"{emotion['features']['mean_heart_rate_bpm']:.0f} bpm")
+        cols[4].metric("Grade / cut", f"{style['grade_name']} · {style['beats_per_cut']}b")
+        st.caption(emotion["disclaimer"])
+
+    cover = report.get("chinese_cover")
+    if cover:
+        synth = cover["synthesis"]
+        st.write(
+            f"**Chinese cover:** {synth['tts_lines']} line(s) sung with `{synth['voice']}` "
+            f"via `{synth['synthesis_backend']}` · separation `{cover['separation']['method']}`"
+        )
+        for w in cover.get("notes", {}).get("warnings", []):
+            st.warning(w)
+
+    final_video = _read_bytes(report["outputs"]["final_video_mp4"])
+    if final_video:
+        st.video(final_video)
+
+    dl = st.columns(4)
+    stem = Path(report["heartbeat_file"]).stem
+    if final_video:
+        dl[0].download_button("final_video.mp4", final_video, file_name=f"{stem}_final_video.mp4",
+                              mime="video/mp4", key=f"{stem}_mv")
+    fa = _read_bytes(report["outputs"]["final_audio_wav"])
+    if fa:
+        dl[1].download_button("final_audio.wav", fa, file_name=f"{stem}_final_audio.wav",
+                              mime="audio/wav", key=f"{stem}_fa")
+    fm = _read_bytes(report["outputs"].get("final_audio_mp3"))
+    if fm:
+        dl[2].download_button("final_audio.mp3", fm, file_name=f"{stem}_final_audio.mp3",
+                              mime="audio/mpeg", key=f"{stem}_fm")
+    zp = _read_bytes(report["outputs"]["all_outputs_zip"])
+    if zp:
+        dl[3].download_button("all_outputs.zip", zp, file_name=f"{stem}_all_outputs.zip",
+                              mime="application/zip", key=f"{stem}_zip_full")
+
+    with st.expander("Diagnostic reports (emotion / cover)"):
+        if emotion:
+            st.json(emotion)
+        if cover:
+            st.json(cover)
+
+
+def full_pipeline_tab(params: ProcessingParams) -> None:
+    st.write(
+        "Upload one or more **heartbeat** recordings and one **English music video (.mp4)**. "
+        "The app aligns and mixes the heartbeat into the song, styles the video by the heart's "
+        "emotion (A), cuts it to the heartbeat (B), and can re-sing the lyrics in Chinese (C)."
+    )
+
+    up_cols = st.columns(2)
+    heartbeat_files = up_cols[0].file_uploader(
+        "Heartbeat recordings (.wav / .mp3)", type=["wav", "mp3"],
+        accept_multiple_files=True, key="mv_heartbeats",
+    )
+    video_file = up_cols[1].file_uploader(
+        "Music video (.mp4)", type=["mp4", "mov", "m4v"], accept_multiple_files=False, key="mv_video",
+    )
+
+    st.markdown("#### Options")
+    o1, o2, o3 = st.columns(3)
+    effect_strength = o1.slider("Effect strength", 0.0, 1.5, 0.9, 0.05, key="mv_effect")
+    heartbeat_gain_db = o2.slider("Heartbeat mix gain (dB)", -30.0, 0.0, -15.0, 1.0, key="mv_gain")
+    duration_limit = o3.number_input("Duration limit (s, 0 = full)", 0.0, 600.0, 0.0, 5.0, key="mv_dur")
+    title_text = st.text_input("Title / dedication overlay", value="", key="mv_title")
+
+    f1, f2, f3, f4 = st.columns(4)
+    enable_emotion = f1.checkbox("A · Emotion styling", value=True, key="mv_emotion")
+    enable_beat_editing = f2.checkbox("B · Heartbeat-driven cuts", value=True, key="mv_beat")
+    enable_subtitles = f3.checkbox("Chinese lyric subtitles", value=True, key="mv_subs",
+                                   help="Burn karaoke-style Chinese lyric lines (requires the Chinese cover below).")
+    show_overlay = f4.checkbox("Diagnostic overlay (debug)", value=False, key="mv_overlay",
+                               help="Show the heartbeat waveform / BPM HUD. Off for a clean, natural music video.")
+
+    st.markdown("#### C · Chinese cover (lyrics sung in Chinese)")
+    enable_cover = st.checkbox("Enable Chinese cover", value=False, key="mv_cover")
+    cover_options = None
+    if enable_cover:
+        c1, c2 = st.columns([2, 1])
+        lyrics = c1.text_area(
+            "Chinese lyrics (one line per lyric line). Leave empty to only strip the original vocal.",
+            value="", height=140, key="mv_lyrics",
+            placeholder="我有一个梦想\n一首歌在心中\n随着心跳起舞",
+        )
+        lrc = c1.text_area(
+            "Optional timed LRC ([mm:ss.xx] per line) — overrides even spacing.",
+            value="", height=90, key="mv_lrc",
+        )
+        voice = c2.selectbox(
+            "Chinese voice",
+            ["zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural", "zh-CN-YunyangNeural",
+             "zh-CN-XiaoyiNeural", "zh-CN-liaoning-XiaobeiNeural"],
+            key="mv_voice",
+        )
+        vocal_gain = c2.slider("Cover vocal gain (dB)", -12.0, 6.0, -2.0, 1.0, key="mv_vocgain")
+        c2.caption("Chinese singing uses edge-tts online. Requires internet access.")
+        cover_options = {
+            "enabled": True,
+            "lyrics": lyrics or None,
+            "lrc": lrc or None,
+            "voice": voice,
+            "vocal_gain_db": vocal_gain,
+        }
+
+    can_run = bool(heartbeat_files) and video_file is not None
+    if not can_run:
+        st.info("Upload at least one heartbeat file and one music video to enable generation.")
+        return
+
+    if st.button("Generate heartbeat music video", type="primary", key="mv_run"):
+        with st.spinner("Rendering… this can take a while for long videos."):
+            reports = run_full_pipeline(
+                heartbeat_files, video_file, params, effect_strength, heartbeat_gain_db,
+                title_text, enable_emotion, enable_beat_editing, show_overlay, enable_subtitles,
+                duration_limit if duration_limit > 0 else None, cover_options,
+            )
+        st.session_state["mv_reports"] = reports
+
+    reports = st.session_state.get("mv_reports", [])
+    if reports:
+        st.success(f"Generated {len(reports)} music video(s).")
+        for report in reports:
+            with st.expander(Path(report["heartbeat_file"]).name, expanded=len(reports) == 1):
+                render_pipeline_report(report)
+
+
+def main() -> None:
+    st.title("LegaSynth · Heartbeat-Inspired Music Video")
+    params = sidebar_params()
+    save_outputs = st.sidebar.checkbox("Also save outputs to D:\\Heartbeat\\outputs", value=True)
+
+    tab_mv, tab_stage1 = st.tabs(["🎬 Heartbeat music video", "🔬 Stage 1 · heartbeat analysis"])
+    with tab_mv:
+        full_pipeline_tab(params)
+    with tab_stage1:
+        stage1_tab(params, save_outputs)
 
 
 if __name__ == "__main__":
