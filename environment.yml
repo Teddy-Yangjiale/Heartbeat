@@ -1,0 +1,18 @@
+name: heartbeat
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - pip
+  - pip:
+      - streamlit
+      - opencv-python
+      - moviepy
+      - pydub
+      - librosa
+      - soundfile
+      - imageio-ffmpeg
