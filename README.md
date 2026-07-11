@@ -26,6 +26,9 @@ Repository: [Teddy-Yangjiale/Heartbeat](https://github.com/Teddy-Yangjiale/Heart
 - 参数 JSON
 - 诊断 Markdown 报告
 - 诊断 PNG 图
+- 录音质量评分、风险原因和是否建议用于 loop
+- 多时间窗 BPM 共识分析
+- 按节律稳定性与心音包络质量排名的 loop 候选表
 - Streamlit 页面中的单文件 ZIP 和批量 ZIP 下载
 
 处理流程：
@@ -46,6 +49,23 @@ heartbeat .wav/.mp3
 -> zero-crossing adjustment and edge fade
 -> export JSON / CSV / WAV / PNG / ZIP
 ```
+
+### 1.1 面对说话声和环境噪声的预处理
+
+听诊器录音不是纯心音：讲话、空调、手持摩擦和低频振动都可能被录入。当前版本默认启用 `Speech and noise suppression`，处理链路为：
+
+```text
+DC removal
+-> 25-160 Hz heart-sound band-pass
+-> harmonic/percussive separation (抑制持续语音的基频与谐波)
+-> adaptive spectral noise gate (压低稳定环境噪声)
+-> BPM / beat detection
+-> beat-synchronous soft gate (保留每拍 S1/S2 附近，衰减拍间声音)
+```
+
+因此 `cleaned.wav`、`filtered_detection.wav` 和 `best_loop.wav` 都来自抑制后的信号；`best_loop.wav` 不再从只去 DC 的原始录音截取。Balanced 模式会让拍间音频降低约 `28 dB`，但不会把它硬切为静音，以避免明显的门限爆音。
+
+这是一种 CPU-only 的信号处理方案，不是通用的人声分离模型。若讲话声刚好与 S1/S2 同时发生，单支听诊器麦克风没有独立参考信号，无法保证完全移除而不伤害心音。此时应优先使用 `Strong`，或重新安静录一段至少 10-15 秒的素材。
 
 ## 2. 从零开始启动
 
@@ -248,6 +268,18 @@ conda run -n heartbeat python scripts\process_files.py "C:\path\heartbeat.wav" -
 
 ## 6. 输出文件说明
 
+### `recording_quality.json`
+
+自动化、非医疗诊断的录音可用性评估。包含 `score`（0-100）、`grade`、是否建议用于 loop，以及具体风险原因，例如录音过短、clipping、心音频段能量不足、不同时间窗 BPM 不一致或心音包络对比度不足。
+
+### `window_analysis.csv`
+
+将录音按重叠时间窗分别估计 BPM。`is_consensus_inlier` 为 `true` 的窗口会参与最终 BPM 的中位数共识；不一致的窗口会被标记，不再单独主导最终 BPM。
+
+### `loop_candidates.csv`
+
+候选 loop 的质量排名。除 `regularity_score` 外，还包含 `envelope_snr_db` 和 `quality_score`。系统优先选择规则性高、心音峰相对背景更清晰的候选，而不是只按 IBI 方差排序。
+
 每个输入音频会生成以下文件。
 
 ### `tempo_summary.json`
@@ -335,13 +367,16 @@ peak detection 主要是在 envelope 上做的。
 
 - 转 mono
 - 去 DC offset
+- 心音频段 band-pass
+- harmonic/percussive separation 和自适应频谱降噪
+- 以检测到的心跳为中心的软门控，压低拍间说话声
 - normalize
 
 适合人耳试听，也适合作为后续音频处理的基础版本。
 
 ### `filtered_detection.wav`
 
-用于检测的滤波音频。它经过 band-pass filter，默认保留心跳常见能量范围。
+用于试听和诊断的滤波音频。内部节拍检测在 heart-sound band-pass、harmonic/percussive separation 和自适应频谱降噪之后完成；导出的这个文件还会施加与 `cleaned.wav` 相同的软门控，确保拍间说话声不会因为“检测音频”的历史命名而残留。
 
 注意：这个文件主要用于诊断检测效果，不一定是最好听的版本。
 
@@ -358,12 +393,13 @@ peak detection 主要是在 envelope 上做的。
 
 ### `diagnostic_plot.png`
 
-诊断图包含四部分：
+诊断图包含五部分：
 
 1. 原始 mono waveform
-2. band-pass filtered detection signal
-3. envelope、detected beats 和 selected loop
-4. local BPM by IBI
+2. 抑制语音后的 detection signal
+3. beat-synchronous cleaned heartbeat audio
+4. envelope、detected beats 和 selected loop
+5. local BPM by IBI
 
 如果 BPM 或 beat count 不对，先看这张图：
 
@@ -375,7 +411,7 @@ peak detection 主要是在 envelope 上做的。
 
 ### `Band-pass low cutoff (Hz)`
 
-默认：`20 Hz`
+默认：`25 Hz`
 
 作用：控制检测滤波器的低频下限。
 
@@ -397,7 +433,7 @@ peak detection 主要是在 envelope 上做的。
 
 ### `Band-pass high cutoff (Hz)`
 
-默认：`180 Hz`
+默认：`160 Hz`
 
 作用：控制检测滤波器的高频上限。
 
@@ -577,6 +613,28 @@ peak detection 主要是在 envelope 上做的。
 
 - 有 click：调到 `20-40 ms`。
 - 心跳 transient 很重要：保持 `5-12 ms`。
+
+## 7.1 语音和噪声抑制参数
+
+### `Enable speech/noise suppression`
+
+默认开启。关闭后系统只做带通和节拍分析，适合需要保留原始听诊器声音、或想比较算法前后差异的情况；但 `cleaned.wav` 和 `best_loop.wav` 会更容易保留说话声。
+
+### `Suppression strength`
+
+- `Mild`：拍间衰减约 `18 dB`，对微弱心音最保守，适合录音本身较干净。
+- `Balanced`：默认，拍间衰减约 `28 dB`，兼顾说话声压制和 S1/S2 保留。
+- `Strong`：拍间衰减约 `36 dB`，并加强持续语音/环境声抑制；适合明显有人说话的录音，但弱心音可能变轻。
+
+这三个预设会写入 `processing_parameters.json`：`hpss_margin` 控制对持续谐波成分的抑制，`spectral_reduction_strength` 控制频谱门限强度，`beat_gate_pre_ms` / `beat_gate_post_ms` 控制每拍前后被完整保留的时间窗，`between_beat_attenuation_db` 控制拍间衰减量。
+
+### 新版三个 WAV 输出的关系
+
+- `filtered_detection.wav`：内部检测信号经过限带、去持续语音、自适应降噪及导出软门控后的可听诊断版本；诊断图第二行展示的是门控前、真正用于找 beat 的信号。
+- `cleaned.wav`：在上述信号上，再按检测到的心跳时刻施加软门控的可听心音版本。
+- `best_loop.wav`：从 `cleaned.wav` 的最稳定 IBI 窗口截取，并在边界做 zero-crossing 和 fade 的后续混音素材。
+
+诊断图现在有五部分：原始波形、抑制语音后的检测信号、最终 cleaned 音频、envelope/beat/loop，以及 local BPM。页面还会显示 `Beat-window coverage`，表示有多少录音时长处在保留心音的时间窗内。
 
 ## 8. 如何判断结果好不好
 

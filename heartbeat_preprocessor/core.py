@@ -25,8 +25,8 @@ from scipy.io import wavfile
 
 @dataclass(frozen=True)
 class ProcessingParams:
-    bandpass_low_hz: float = 20.0
-    bandpass_high_hz: float = 180.0
+    bandpass_low_hz: float = 25.0
+    bandpass_high_hz: float = 160.0
     envelope_lowpass_hz: float = 6.0
     min_bpm: float = 40.0
     max_bpm: float = 140.0
@@ -37,6 +37,18 @@ class ProcessingParams:
     crossfade_ms: float = 12.0
     zero_crossing_search_ms: float = 20.0
     export_envelope_hz: float = 100.0
+    enable_speech_suppression: bool = True
+    hpss_margin: float = 2.0
+    spectral_noise_percentile: float = 15.0
+    spectral_reduction_strength: float = 1.15
+    spectral_floor_db: float = -30.0
+    beat_gate_pre_ms: float = 90.0
+    beat_gate_post_ms: float = 300.0
+    between_beat_attenuation_db: float = -28.0
+    analysis_window_seconds: float = 6.0
+    analysis_window_hop_seconds: float = 3.0
+    min_consensus_windows: int = 2
+    loop_candidate_count: int = 5
 
 
 def safe_stem(name: str) -> str:
@@ -62,32 +74,47 @@ def process_audio_bytes(
     mono = to_mono_float(raw)
     duration = float(len(mono) / sr) if sr else 0.0
 
-    cleaned = remove_dc(mono)
-    peak = np.max(np.abs(cleaned)) if len(cleaned) else 0.0
+    dc_removed = remove_dc(mono)
+    peak = np.max(np.abs(dc_removed)) if len(dc_removed) else 0.0
     if peak > 0:
-        cleaned_for_analysis = cleaned / peak
+        cleaned_for_analysis = dc_removed / peak
     else:
-        cleaned_for_analysis = cleaned.copy()
+        cleaned_for_analysis = dc_removed.copy()
 
-    filtered = bandpass(cleaned_for_analysis, sr, params.bandpass_low_hz, params.bandpass_high_hz)
+    band_limited = bandpass(cleaned_for_analysis, sr, params.bandpass_low_hz, params.bandpass_high_hz)
+    filtered = suppress_non_heart_content(band_limited, sr, params)
     envelope = extract_envelope(filtered, sr, params.envelope_lowpass_hz)
-    bpm_info = estimate_period_from_autocorr(envelope, sr, params.min_bpm, params.max_bpm)
+    bpm_info, window_analysis = estimate_bpm_with_consensus(envelope, sr, params)
     beat_times = detect_beats(envelope, sr, bpm_info["period_seconds"], params)
     ibi = np.diff(beat_times)
-    loop_info = choose_best_loop(beat_times, duration, params.target_loop_beats, bpm_info["period_seconds"])
+    loop_info, loop_candidates = rank_loop_candidates(
+        beat_times,
+        envelope,
+        sr,
+        duration,
+        params.target_loop_beats,
+        bpm_info["period_seconds"],
+        params.loop_candidate_count,
+    )
+    cleaned = apply_beat_synchronous_gate(filtered, sr, beat_times, params)
     loop_audio, loop_audio_info = cut_loop(cleaned, sr, loop_info, params)
 
-    filtered_audio = normalize_for_wav(filtered, target_peak=0.8)
+    # Export the gated version as well: users should not hear residual talk in a diagnostic WAV.
+    filtered_audio = normalize_for_wav(cleaned, target_peak=0.8)
     cleaned_audio = normalize_for_wav(cleaned, target_peak=0.8)
     loop_audio = normalize_for_wav(loop_audio, target_peak=0.8)
 
-    quality = compute_quality(mono, cleaned, sr, source_info)
+    quality = compute_quality(mono, cleaned, sr, source_info, params, beat_times)
+    recording_quality = assess_recording_quality(
+        mono, filtered, envelope, beat_times, sr, bpm_info, window_analysis, quality
+    )
     tempo_summary = build_summary(
         filename=filename,
         sr=sr,
         duration=duration,
         source_info=source_info,
         quality=quality,
+        recording_quality=recording_quality,
         bpm_info=bpm_info,
         beat_times=beat_times,
         ibi=ibi,
@@ -99,10 +126,13 @@ def process_audio_bytes(
     envelope_df = make_envelope_frame(envelope, sr, params.export_envelope_hz)
     beats_df = make_beats_frame(beat_times)
     ibi_df = make_ibi_frame(beat_times)
+    window_analysis_df = pd.DataFrame(window_analysis)
+    loop_candidates_df = pd.DataFrame(loop_candidates)
     diagnostic_png = make_diagnostic_plot(
         stem=stem,
         raw=mono,
         filtered=filtered,
+        cleaned=cleaned,
         envelope=envelope,
         beat_times=beat_times,
         sr=sr,
@@ -118,6 +148,9 @@ def process_audio_bytes(
         "beat_times.csv": beats_df.to_csv(index=False).encode("utf-8"),
         "ibi.csv": ibi_df.to_csv(index=False).encode("utf-8"),
         "envelope.csv": envelope_df.to_csv(index=False).encode("utf-8"),
+        "window_analysis.csv": window_analysis_df.to_csv(index=False).encode("utf-8"),
+        "loop_candidates.csv": loop_candidates_df.to_csv(index=False).encode("utf-8"),
+        "recording_quality.json": json.dumps(recording_quality, indent=2).encode("utf-8"),
         "cleaned.wav": wav_bytes(sr, cleaned_audio),
         "filtered_detection.wav": wav_bytes(sr, filtered_audio),
         "best_loop.wav": wav_bytes(sr, loop_audio),
@@ -134,8 +167,11 @@ def process_audio_bytes(
         "envelope": envelope,
         "beat_times": beat_times,
         "ibi": ibi,
+        "window_analysis": window_analysis,
+        "loop_candidates": loop_candidates,
         "loop_audio": loop_audio,
         "summary": tempo_summary,
+        "recording_quality": recording_quality,
         "artifacts": artifacts,
         "zip_bytes": make_zip_bytes(stem, artifacts),
     }
@@ -145,6 +181,7 @@ def make_markdown_report(summary: dict[str, Any]) -> str:
     tempo = summary["tempo"]
     loop = summary["best_loop"]
     quality = summary["quality"]
+    recording_quality = summary["recording_quality"]
     lines = [
         f"# Heartbeat Diagnostic Report: {summary['filename']}",
         "",
@@ -160,10 +197,15 @@ def make_markdown_report(summary: dict[str, Any]) -> str:
         f"- DC offset: {quality['dc_offset']:.8f}",
         f"- Clipping fraction: {quality['clipping_fraction']:.8f}",
         f"- Clipping suspected: {quality['is_clipping_suspected']}",
+        f"- Speech/noise suppression enabled: {quality['speech_suppression_enabled']}",
+        f"- Beat-window coverage: {quality['beat_window_coverage_fraction']:.3f}",
+        f"- Recording quality: {recording_quality['grade']} ({recording_quality['score']:.1f}/100)",
         "",
         "## Tempo And Beats",
         f"- Autocorrelation BPM: {tempo['estimated_bpm']:.3f}",
         f"- Autocorrelation confidence: {tempo['autocorr_confidence']:.6f}",
+        f"- BPM method: {tempo['method']}",
+        f"- Consensus windows: {tempo['consensus_window_count']}/{tempo['window_count']}",
         f"- Detected beats: {tempo['detected_beats']}",
         f"- Median-IBI BPM: {tempo['picked_bpm_from_median_ibi']}",
         f"- IBI mean: {tempo['ibi_mean_seconds']}",
@@ -177,6 +219,7 @@ def make_markdown_report(summary: dict[str, Any]) -> str:
         f"- Beats: {loop['num_beats']}",
         f"- Local BPM: {loop['local_bpm']:.3f}",
         f"- Regularity score: {loop['regularity_score']}",
+        f"- Loop quality score: {loop['quality_score']:.1f}/100",
         "",
         "## Processing Parameters",
     ]
@@ -285,6 +328,80 @@ def bandpass(x: np.ndarray, sr: int, low_hz: float, high_hz: float) -> np.ndarra
     return y.astype(np.float32)
 
 
+def suppress_non_heart_content(x: np.ndarray, sr: int, params: ProcessingParams) -> np.ndarray:
+    """Favor short, low-frequency cardiac transients over sustained speech and room noise."""
+    if not len(x) or not params.enable_speech_suppression:
+        return x.astype(np.float32, copy=True)
+
+    n_fft = min(2048, max(256, 2 ** int(np.floor(np.log2(max(256, sr * 0.08))))))
+    hop_length = max(64, n_fft // 4)
+    if len(x) < n_fft:
+        return spectral_noise_gate(x, sr, params)
+
+    spectrum = librosa.stft(x.astype(np.float32), n_fft=n_fft, hop_length=hop_length, center=True)
+    harmonic, percussive = librosa.decompose.hpss(
+        spectrum,
+        kernel_size=(31, 17),
+        margin=(max(1.0, params.hpss_margin), 1.0),
+    )
+    heart_like = librosa.istft(percussive, hop_length=hop_length, length=len(x))
+    return spectral_noise_gate(heart_like, sr, params)
+
+
+def spectral_noise_gate(x: np.ndarray, sr: int, params: ProcessingParams) -> np.ndarray:
+    """Remove the persistent spectral floor without using a prerecorded noise sample."""
+    if not len(x):
+        return x.astype(np.float32, copy=True)
+    n_fft = min(2048, max(256, 2 ** int(np.floor(np.log2(max(256, sr * 0.08))))))
+    hop_length = max(64, n_fft // 4)
+    if len(x) < n_fft:
+        return x.astype(np.float32, copy=True)
+
+    spectrum = librosa.stft(x.astype(np.float32), n_fft=n_fft, hop_length=hop_length, center=True)
+    magnitude = np.abs(spectrum)
+    noise_floor = np.percentile(magnitude, params.spectral_noise_percentile, axis=1, keepdims=True)
+    subtraction = params.spectral_reduction_strength * noise_floor
+    floor_gain = float(10.0 ** (params.spectral_floor_db / 20.0))
+    gain = np.maximum(1.0 - subtraction / (magnitude + 1e-9), floor_gain)
+    gated = librosa.istft(spectrum * gain, hop_length=hop_length, length=len(x))
+    return gated.astype(np.float32)
+
+
+def apply_beat_synchronous_gate(
+    x: np.ndarray, sr: int, beat_times: np.ndarray, params: ProcessingParams
+) -> np.ndarray:
+    """Keep the S1/S2 region of each beat and attenuate audio between cardiac events."""
+    if not len(x) or not params.enable_speech_suppression or not len(beat_times):
+        return x.astype(np.float32, copy=True)
+
+    floor_gain = float(10.0 ** (params.between_beat_attenuation_db / 20.0))
+    mask = np.full(len(x), floor_gain, dtype=np.float32)
+    pre = max(0, int(params.beat_gate_pre_ms * sr / 1000.0))
+    post = max(1, int(params.beat_gate_post_ms * sr / 1000.0))
+    ramp = max(1, min(int(0.025 * sr), (pre + post) // 5))
+
+    for time_seconds in beat_times:
+        center = int(round(float(time_seconds) * sr))
+        start = max(0, center - pre)
+        end = min(len(x), center + post)
+        if end <= start:
+            continue
+        mask[start:end] = 1.0
+        left_start = max(0, start - ramp)
+        if start > left_start:
+            mask[left_start:start] = np.maximum(
+                mask[left_start:start],
+                np.linspace(floor_gain, 1.0, start - left_start, endpoint=False, dtype=np.float32),
+            )
+        right_end = min(len(x), end + ramp)
+        if right_end > end:
+            mask[end:right_end] = np.maximum(
+                mask[end:right_end],
+                np.linspace(1.0, floor_gain, right_end - end, endpoint=False, dtype=np.float32),
+            )
+    return (x * mask).astype(np.float32)
+
+
 def extract_envelope(x: np.ndarray, sr: int, lowpass_hz: float) -> np.ndarray:
     if not len(x):
         return x.copy()
@@ -336,6 +453,81 @@ def estimate_period_from_autocorr(
     }
 
 
+def estimate_bpm_with_consensus(
+    envelope: np.ndarray, sr: int, params: ProcessingParams
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    global_estimate = estimate_period_from_autocorr(envelope, sr, params.min_bpm, params.max_bpm)
+    window_samples = max(sr, int(params.analysis_window_seconds * sr))
+    hop_samples = max(sr // 2, int(params.analysis_window_hop_seconds * sr))
+    windows: list[dict[str, Any]] = []
+
+    if len(envelope) >= window_samples:
+        starts = list(range(0, len(envelope) - window_samples + 1, hop_samples))
+        final_start = len(envelope) - window_samples
+        if not starts or starts[-1] != final_start:
+            starts.append(final_start)
+        for start in starts:
+            segment = envelope[start : start + window_samples]
+            estimate = estimate_period_from_autocorr(segment, sr, params.min_bpm, params.max_bpm)
+            beats = detect_beats(segment, sr, estimate["period_seconds"], params)
+            windows.append(
+                {
+                    "start_seconds": float(start / sr),
+                    "end_seconds": float((start + len(segment)) / sr),
+                    "estimated_bpm": float(estimate["estimated_bpm"]),
+                    "autocorr_confidence": float(estimate["autocorr_confidence"]),
+                    "detected_beats": int(len(beats)),
+                    "is_consensus_inlier": False,
+                }
+            )
+
+    usable = [
+        item
+        for item in windows
+        if item["autocorr_confidence"] >= 0.08 and item["detected_beats"] >= 3
+    ]
+    consensus_bpm: float | None = None
+    bpm_mad: float | None = None
+    if len(usable) >= params.min_consensus_windows:
+        values = np.asarray([item["estimated_bpm"] for item in usable], dtype=np.float64)
+        consensus_bpm = float(np.median(values))
+        bpm_mad = float(np.median(np.abs(values - consensus_bpm)))
+        tolerance = max(4.0, 3.0 * bpm_mad)
+        for item in windows:
+            item["is_consensus_inlier"] = bool(
+                item["autocorr_confidence"] >= 0.08
+                and item["detected_beats"] >= 3
+                and abs(item["estimated_bpm"] - consensus_bpm) <= tolerance
+            )
+
+    inliers = [item for item in windows if item["is_consensus_inlier"]]
+    if consensus_bpm is not None and len(inliers) >= params.min_consensus_windows:
+        period = 60.0 / consensus_bpm
+        confidence = float(np.mean([item["autocorr_confidence"] for item in inliers]))
+        estimate: dict[str, Any] = {
+            "period_seconds": period,
+            "estimated_bpm": consensus_bpm,
+            "autocorr_confidence": confidence,
+            "method": "multi_window_median_consensus",
+            "global_autocorr_bpm": float(global_estimate["estimated_bpm"]),
+            "global_autocorr_confidence": float(global_estimate["autocorr_confidence"]),
+            "window_count": int(len(windows)),
+            "consensus_window_count": int(len(inliers)),
+            "window_bpm_mad": bpm_mad,
+        }
+    else:
+        estimate = {
+            **global_estimate,
+            "method": "global_autocorrelation_fallback",
+            "global_autocorr_bpm": float(global_estimate["estimated_bpm"]),
+            "global_autocorr_confidence": float(global_estimate["autocorr_confidence"]),
+            "window_count": int(len(windows)),
+            "consensus_window_count": 0,
+            "window_bpm_mad": None,
+        }
+    return estimate, windows
+
+
 def detect_beats(
     envelope: np.ndarray, sr: int, period_seconds: float, params: ProcessingParams
 ) -> np.ndarray:
@@ -360,44 +552,93 @@ def detect_beats(
 def choose_best_loop(
     beat_times: np.ndarray, duration: float, target_loop_beats: int, fallback_period: float
 ) -> dict[str, Any]:
+    best, _ = rank_loop_candidates(
+        beat_times,
+        np.array([], dtype=np.float32),
+        1,
+        duration,
+        target_loop_beats,
+        fallback_period,
+        1,
+    )
+    return best
+
+
+def rank_loop_candidates(
+    beat_times: np.ndarray,
+    envelope: np.ndarray,
+    sr: int,
+    duration: float,
+    target_loop_beats: int,
+    fallback_period: float,
+    candidate_limit: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     beats = np.asarray(beat_times, dtype=np.float64)
     n_intervals = max(1, int(target_loop_beats))
+    candidates: list[dict[str, Any]] = []
     if len(beats) >= n_intervals + 1:
-        best: tuple[float, int, np.ndarray] | None = None
         for i in range(0, len(beats) - n_intervals):
             local = np.diff(beats[i : i + n_intervals + 1])
             if np.any(local <= 0):
                 continue
-            score = float(np.std(local) / (np.mean(local) + 1e-9))
-            if best is None or score < best[0]:
-                best = (score, i, local)
-        if best is not None:
-            score, i, local = best
+            regularity = float(np.std(local) / (np.mean(local) + 1e-9))
             start = float(beats[i])
             end = float(beats[i + n_intervals])
-            local_bpm = float(60.0 / np.median(local))
-            return {
-                "start_seconds": start,
-                "end_seconds": end,
-                "duration_seconds": end - start,
-                "num_beats": n_intervals,
-                "local_bpm": local_bpm,
-                "ibi_std_seconds": float(np.std(local)),
-                "regularity_score": score,
-                "method": "lowest_ibi_variance",
-            }
-    start = 0.0
-    end = min(duration, fallback_period * n_intervals)
-    return {
-        "start_seconds": start,
-        "end_seconds": end,
-        "duration_seconds": max(0.0, end - start),
+            snr_db = estimate_envelope_snr(envelope, sr, start, end, beats[i : i + n_intervals + 1])
+            regularity_component = float(np.exp(-7.0 * regularity))
+            snr_component = float(np.clip(snr_db / 40.0, 0.0, 1.0))
+            quality_score = float(100.0 * (0.75 * regularity_component + 0.25 * snr_component))
+            candidates.append(
+                {
+                    "start_seconds": start,
+                    "end_seconds": end,
+                    "duration_seconds": end - start,
+                    "num_beats": n_intervals,
+                    "local_bpm": float(60.0 / np.median(local)),
+                    "ibi_std_seconds": float(np.std(local)),
+                    "regularity_score": regularity,
+                    "envelope_snr_db": snr_db,
+                    "quality_score": quality_score,
+                    "method": "regularity_and_envelope_quality",
+                }
+            )
+        if candidates:
+            candidates.sort(key=lambda item: item["quality_score"], reverse=True)
+            for rank, candidate in enumerate(candidates, start=1):
+                candidate["rank"] = rank
+            selected = dict(candidates[0])
+            selected.pop("rank", None)
+            return selected, candidates[: max(1, int(candidate_limit))]
+
+    fallback = {
+        "start_seconds": 0.0,
+        "end_seconds": min(duration, fallback_period * n_intervals),
+        "duration_seconds": max(0.0, min(duration, fallback_period * n_intervals)),
         "num_beats": n_intervals,
         "local_bpm": float(60.0 / fallback_period) if fallback_period > 0 else 0.0,
         "ibi_std_seconds": None,
         "regularity_score": None,
+        "envelope_snr_db": None,
+        "quality_score": 0.0,
         "method": "fallback_autocorr_period",
     }
+    return fallback, [{**fallback, "rank": 1}]
+
+
+def estimate_envelope_snr(
+    envelope: np.ndarray, sr: int, start_seconds: float, end_seconds: float, beat_times: np.ndarray
+) -> float:
+    if not len(envelope) or sr <= 0:
+        return 0.0
+    start = max(0, int(round(start_seconds * sr)))
+    end = min(len(envelope), int(round(end_seconds * sr)))
+    segment = envelope[start:end]
+    if not len(segment):
+        return 0.0
+    baseline = float(np.percentile(segment, 30))
+    peak_indices = np.clip(np.round(np.asarray(beat_times) * sr).astype(int), 0, len(envelope) - 1)
+    peak_level = float(np.mean(envelope[peak_indices])) if len(peak_indices) else float(np.percentile(segment, 90))
+    return float(20.0 * math.log10((peak_level + 1e-6) / (baseline + 1e-6)))
 
 
 def cut_loop(
@@ -451,11 +692,17 @@ def apply_edge_fades(x: np.ndarray, sr: int, fade_ms: float) -> np.ndarray:
 
 
 def compute_quality(
-    raw_mono: np.ndarray, cleaned: np.ndarray, sr: int, source_info: dict[str, Any]
+    raw_mono: np.ndarray,
+    cleaned: np.ndarray,
+    sr: int,
+    source_info: dict[str, Any],
+    params: ProcessingParams,
+    beat_times: np.ndarray,
 ) -> dict[str, Any]:
     rms = float(np.sqrt(np.mean(cleaned * cleaned))) if len(cleaned) else 0.0
     peak = float(np.max(np.abs(cleaned))) if len(cleaned) else 0.0
     clipping_fraction = float(np.mean(np.abs(raw_mono) >= 0.999)) if len(raw_mono) else 0.0
+    coverage = beat_window_coverage(len(cleaned), sr, beat_times, params)
     return {
         "rms_dbfs": dbfs(rms),
         "peak_dbfs": dbfs(peak),
@@ -464,6 +711,105 @@ def compute_quality(
         "is_clipping_suspected": bool(clipping_fraction > 0.0005),
         "duration_seconds": float(len(raw_mono) / sr) if sr else 0.0,
         "channels": source_info["channels"],
+        "speech_suppression_enabled": bool(params.enable_speech_suppression),
+        "beat_window_coverage_fraction": coverage,
+        "between_beat_attenuation_db": float(params.between_beat_attenuation_db),
+    }
+
+
+def beat_window_coverage(
+    sample_count: int, sr: int, beat_times: np.ndarray, params: ProcessingParams
+) -> float:
+    if not sample_count or not sr or not len(beat_times):
+        return 0.0
+    intervals: list[tuple[int, int]] = []
+    pre = max(0, int(params.beat_gate_pre_ms * sr / 1000.0))
+    post = max(1, int(params.beat_gate_post_ms * sr / 1000.0))
+    for time_seconds in beat_times:
+        center = int(round(float(time_seconds) * sr))
+        intervals.append((max(0, center - pre), min(sample_count, center + post)))
+    intervals.sort()
+    covered = 0
+    last_end = 0
+    for start, end in intervals:
+        start = max(start, last_end)
+        if end > start:
+            covered += end - start
+            last_end = end
+    return float(covered / sample_count)
+
+
+def assess_recording_quality(
+    raw_mono: np.ndarray,
+    filtered: np.ndarray,
+    envelope: np.ndarray,
+    beat_times: np.ndarray,
+    sr: int,
+    bpm_info: dict[str, Any],
+    window_analysis: list[dict[str, Any]],
+    base_quality: dict[str, Any],
+) -> dict[str, Any]:
+    """Produce a conservative recording-usability score, not a medical diagnosis."""
+    reasons: list[str] = []
+    score = 100.0
+    duration = float(len(raw_mono) / sr) if sr else 0.0
+    if duration < 8.0:
+        score -= 25.0
+        reasons.append("Recording is shorter than 8 seconds; BPM consensus is less reliable.")
+    if base_quality["is_clipping_suspected"]:
+        score -= 25.0
+        reasons.append("Input clipping was detected.")
+
+    filtered_rms = float(np.sqrt(np.mean(filtered * filtered))) if len(filtered) else 0.0
+    raw_rms = float(np.sqrt(np.mean(raw_mono * raw_mono))) if len(raw_mono) else 0.0
+    heart_band_ratio_db = float(20.0 * math.log10((filtered_rms + 1e-9) / (raw_rms + 1e-9)))
+    if heart_band_ratio_db < -24.0:
+        score -= 18.0
+        reasons.append("Very little energy remains in the selected heart-sound band.")
+
+    beat_count = int(len(beat_times))
+    expected_beats = duration * float(bpm_info["estimated_bpm"]) / 60.0
+    if beat_count < 4 or (expected_beats >= 4 and beat_count < expected_beats * 0.45):
+        score -= 20.0
+        reasons.append("Too few reliable heartbeat peaks were detected.")
+
+    consensus_windows = int(bpm_info.get("consensus_window_count", 0))
+    window_count = int(bpm_info.get("window_count", 0))
+    if window_count >= 2 and consensus_windows < 2:
+        score -= 18.0
+        reasons.append("BPM estimates disagree across recording windows.")
+    elif window_count >= 2 and consensus_windows / window_count < 0.5:
+        score -= 10.0
+        reasons.append("Only a minority of time windows agree on BPM.")
+
+    envelope_spread = float(np.percentile(envelope, 90) - np.percentile(envelope, 20)) if len(envelope) else 0.0
+    if envelope_spread < 0.12:
+        score -= 12.0
+        reasons.append("Heartbeat envelope has low contrast against the residual background.")
+
+    score = float(np.clip(score, 0.0, 100.0))
+    if score >= 75.0:
+        grade = "good"
+    elif score >= 50.0:
+        grade = "usable_with_caution"
+    else:
+        grade = "poor"
+    if not reasons:
+        reasons.append("No major automated recording-quality issue was detected.")
+    return {
+        "score": score,
+        "grade": grade,
+        "is_recommended_for_loop": bool(score >= 50.0 and beat_count >= 4),
+        "reasons": reasons,
+        "metrics": {
+            "duration_seconds": duration,
+            "detected_beats": beat_count,
+            "expected_beats_from_bpm": expected_beats,
+            "heart_band_to_raw_rms_db": heart_band_ratio_db,
+            "envelope_contrast": envelope_spread,
+            "window_count": window_count,
+            "consensus_window_count": consensus_windows,
+        },
     }
 
 
@@ -473,6 +819,7 @@ def build_summary(
     duration: float,
     source_info: dict[str, Any],
     quality: dict[str, Any],
+    recording_quality: dict[str, Any],
     bpm_info: dict[str, float],
     beat_times: np.ndarray,
     ibi: np.ndarray,
@@ -485,6 +832,7 @@ def build_summary(
         "duration_seconds": duration,
         "source": source_info,
         "quality": quality,
+        "recording_quality": recording_quality,
         "tempo": {
             **bpm_info,
             "detected_beats": int(len(beat_times)),
@@ -550,6 +898,7 @@ def make_diagnostic_plot(
     stem: str,
     raw: np.ndarray,
     filtered: np.ndarray,
+    cleaned: np.ndarray,
     envelope: np.ndarray,
     beat_times: np.ndarray,
     sr: int,
@@ -557,25 +906,26 @@ def make_diagnostic_plot(
     ibi: np.ndarray,
     bpm_info: dict[str, float],
 ) -> bytes:
-    fig, axes = plt.subplots(4, 1, figsize=(12, 9), sharex=False)
+    fig, axes = plt.subplots(5, 1, figsize=(12, 11), sharex=False)
     fig.suptitle(f"Heartbeat preprocessing diagnostics: {stem}")
     plot_signal(axes[0], raw, sr, "Raw mono waveform")
-    plot_signal(axes[1], filtered, sr, "Band-pass filtered detection signal")
+    plot_signal(axes[1], filtered, sr, "Speech-suppressed detection signal (band-pass + HPSS + spectral gate)")
+    plot_signal(axes[2], cleaned, sr, "Cleaned heartbeat audio (beat-synchronous soft gate applied)")
 
     t_env = np.arange(len(envelope)) / sr if len(envelope) else np.array([])
-    axes[2].plot(t_env, envelope, linewidth=0.8, color="#2c7fb8")
+    axes[3].plot(t_env, envelope, linewidth=0.8, color="#2c7fb8")
     for bt in beat_times:
-        axes[2].axvline(float(bt), color="#e34a33", alpha=0.4, linewidth=0.8)
-    axes[2].axvspan(loop_info["start_seconds"], loop_info["end_seconds"], color="#31a354", alpha=0.2)
-    axes[2].set_title("Envelope, detected beats, and selected loop")
-    axes[2].set_ylabel("Envelope")
+        axes[3].axvline(float(bt), color="#e34a33", alpha=0.4, linewidth=0.8)
+    axes[3].axvspan(loop_info["start_seconds"], loop_info["end_seconds"], color="#31a354", alpha=0.2)
+    axes[3].set_title("Envelope, detected beats, and selected loop")
+    axes[3].set_ylabel("Envelope")
 
     if len(ibi):
-        axes[3].plot(beat_times[:-1], 60.0 / ibi, marker="o", linewidth=1.0, color="#756bb1")
-    axes[3].axhline(bpm_info["estimated_bpm"], color="#636363", linestyle="--", linewidth=1.0)
-    axes[3].set_title("Local BPM by inter-beat interval")
-    axes[3].set_xlabel("Time (s)")
-    axes[3].set_ylabel("BPM")
+        axes[4].plot(beat_times[:-1], 60.0 / ibi, marker="o", linewidth=1.0, color="#756bb1")
+    axes[4].axhline(bpm_info["estimated_bpm"], color="#636363", linestyle="--", linewidth=1.0)
+    axes[4].set_title("Local BPM by inter-beat interval")
+    axes[4].set_xlabel("Time (s)")
+    axes[4].set_ylabel("BPM")
 
     fig.tight_layout()
     buffer = io.BytesIO()

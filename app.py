@@ -18,16 +18,32 @@ st.set_page_config(page_title="LegaSynth Heartbeat Audio Analysis", layout="wide
 
 def sidebar_params() -> ProcessingParams:
     st.sidebar.header("Preprocessing Parameters")
-    low = st.sidebar.slider("Band-pass low cutoff (Hz)", 5.0, 80.0, 20.0, 1.0)
-    high = st.sidebar.slider("Band-pass high cutoff (Hz)", 80.0, 500.0, 180.0, 5.0)
+    low = st.sidebar.slider("Band-pass low cutoff (Hz)", 5.0, 80.0, 25.0, 1.0)
+    high = st.sidebar.slider("Band-pass high cutoff (Hz)", 80.0, 500.0, 160.0, 5.0)
     env_lp = st.sidebar.slider("Envelope low-pass (Hz)", 2.0, 20.0, 6.0, 0.5)
     min_bpm = st.sidebar.slider("Minimum plausible BPM", 30.0, 80.0, 40.0, 1.0)
     max_bpm = st.sidebar.slider("Maximum plausible BPM", 90.0, 180.0, 140.0, 1.0)
     prominence = st.sidebar.slider("Peak prominence", 0.01, 0.60, 0.12, 0.01)
     height_pct = st.sidebar.slider("Peak height percentile", 40.0, 90.0, 65.0, 1.0)
-    suppression = st.sidebar.slider("Double-peak suppression", 0.40, 0.90, 0.65, 0.01)
+    double_peak_suppression = st.sidebar.slider("Double-peak suppression", 0.40, 0.90, 0.65, 0.01)
     loop_beats = st.sidebar.slider("Target loop length (beats)", 2, 12, 4, 1)
     crossfade_ms = st.sidebar.slider("Loop edge fade (ms)", 0.0, 80.0, 12.0, 1.0)
+
+    st.sidebar.subheader("Speech and noise suppression")
+    suppression_enabled = st.sidebar.checkbox("Enable speech/noise suppression", value=True)
+    suppression_profile = st.sidebar.select_slider(
+        "Suppression strength",
+        options=["Mild", "Balanced", "Strong"],
+        value="Balanced",
+        disabled=not suppression_enabled,
+        help="Strong mode removes more talking between heartbeats, but can make weak S1/S2 sounds quieter.",
+    )
+    profiles = {
+        "Mild": {"hpss_margin": 1.4, "spectral_reduction_strength": 0.85, "between_beat_attenuation_db": -18.0, "beat_gate_post_ms": 260.0},
+        "Balanced": {"hpss_margin": 2.0, "spectral_reduction_strength": 1.15, "between_beat_attenuation_db": -28.0, "beat_gate_post_ms": 300.0},
+        "Strong": {"hpss_margin": 2.8, "spectral_reduction_strength": 1.45, "between_beat_attenuation_db": -36.0, "beat_gate_post_ms": 340.0},
+    }
+    speech_suppression_params = profiles[suppression_profile]
     return ProcessingParams(
         bandpass_low_hz=low,
         bandpass_high_hz=high,
@@ -36,9 +52,11 @@ def sidebar_params() -> ProcessingParams:
         max_bpm=max_bpm,
         peak_prominence=prominence,
         peak_height_percentile=height_pct,
-        double_peak_suppression=suppression,
+        double_peak_suppression=double_peak_suppression,
         target_loop_beats=loop_beats,
         crossfade_ms=crossfade_ms,
+        enable_speech_suppression=suppression_enabled,
+        **speech_suppression_params,
     )
 
 
@@ -47,33 +65,47 @@ def render_result(result: dict) -> None:
     tempo = summary["tempo"]
     loop = summary["best_loop"]
     quality = summary["quality"]
+    recording_quality = summary["recording_quality"]
 
     st.subheader(result["name"])
-    cols = st.columns(6)
+    cols = st.columns(7)
     cols[0].metric("Duration", f"{summary['duration_seconds']:.2f}s")
     cols[1].metric("Sample Rate", f"{summary['sample_rate']} Hz")
     cols[2].metric("Estimated BPM", f"{tempo['estimated_bpm']:.1f}")
     cols[3].metric("Detected Beats", str(tempo["detected_beats"]))
     cols[4].metric("IBI Std", "n/a" if tempo["ibi_std_seconds"] is None else f"{tempo['ibi_std_seconds']:.3f}s")
     cols[5].metric("Peak", f"{quality['peak_dbfs']:.1f} dBFS")
+    cols[6].metric("Recording Quality", f"{recording_quality['score']:.0f}/100", recording_quality["grade"])
 
     if quality["is_clipping_suspected"]:
         st.warning("Clipping is suspected in this file. Some detected peaks may be unreliable.")
+    if quality["speech_suppression_enabled"]:
+        st.caption(
+            "Speech/noise suppression is active: only "
+            f"{quality['beat_window_coverage_fraction']:.0%} of the recording is retained at full level around detected beats; "
+            f"the remaining audio is attenuated by {quality['between_beat_attenuation_db']:.0f} dB."
+        )
     if tempo["detected_beats"] < 4:
         st.warning("Few beats were detected. Try lowering peak prominence or widening the BPM range.")
+    if not recording_quality["is_recommended_for_loop"]:
+        st.warning("This recording is not recommended for a production loop: " + " ".join(recording_quality["reasons"]))
 
     st.caption(
         "Best loop: "
         f"{loop['start_seconds']:.2f}s to {loop['end_seconds']:.2f}s, "
         f"{loop['num_beats']} beats, local BPM {loop['local_bpm']:.1f}, method {loop['method']}."
     )
+    st.caption(
+        f"BPM method: {tempo['method']}; consensus windows: "
+        f"{tempo['consensus_window_count']}/{tempo['window_count']}."
+    )
 
     st.image(result["artifacts"]["diagnostic_plot.png"], caption="Diagnostic plot", use_container_width=True)
 
     audio_cols = st.columns(3)
-    audio_cols[0].write("Cleaned audio")
+    audio_cols[0].write("Cleaned heartbeat audio")
     audio_cols[0].audio(result["artifacts"]["cleaned.wav"], format="audio/wav")
-    audio_cols[1].write("Filtered detection audio")
+    audio_cols[1].write("Speech-suppressed diagnostic audio")
     audio_cols[1].audio(result["artifacts"]["filtered_detection.wav"], format="audio/wav")
     audio_cols[2].write("Best loop")
     audio_cols[2].audio(result["artifacts"]["best_loop.wav"], format="audio/wav")
@@ -117,6 +149,9 @@ def render_result(result: dict) -> None:
 
     with st.expander("View tempo summary JSON"):
         st.json(summary)
+    with st.expander("Recording-quality reasons and loop candidates"):
+        st.json(recording_quality)
+        st.dataframe(result["loop_candidates"], use_container_width=True)
 
 
 def main() -> None:
