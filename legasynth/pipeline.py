@@ -58,8 +58,6 @@ def process_one(
     enable_emotion: bool = True,
     enable_beat_editing: bool = True,
     show_overlay: bool = False,
-    enable_subtitles: bool = True,
-    chinese_cover_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     params = params or ProcessingParams()
     heartbeat_path = Path(heartbeat_path)
@@ -96,26 +94,9 @@ def process_one(
     video_meta = prepare_video_audio(copied_video, song_dir)
     loop_wav = pre_dir / "best_loop.wav"
 
-    # Feature C (optional): sing the song's lyrics in Chinese and replace the vocal.
-    cover_report = None
-    render_source_audio_default = None
-    if chinese_cover_options and chinese_cover_options.get("enabled"):
-        from legasynth.chinese_cover import generate_chinese_cover
-
-        cover_report = generate_chinese_cover(
-            song_wav=video_meta["extracted_audio_path"],
-            out_dir=case_dir / "chinese_cover",
-            **{k: v for k, v in chinese_cover_options.items() if k != "enabled"},
-        )
-        render_source_audio_default = cover_report.get("cover_audio_wav")
-
-    # Karaoke-style Chinese lyric subtitles come from the cover's timed lines.
-    subtitles = None
-    if enable_subtitles and cover_report and cover_report.get("lines"):
-        subtitles = cover_report["lines"]
-
+    # Keep the song's original audio and lay the heartbeat loop under it as a rhythmic bed.
     mix_report = mix_heartbeat_with_song(
-        song_wav=render_source_audio_default or video_meta["extracted_audio_path"],
+        song_wav=video_meta["extracted_audio_path"],
         loop_wav=loop_wav,
         heartbeat_summary=heartbeat_summary,
         song_bpm=float(video_meta["estimated_song_bpm"] or heartbeat_summary["tempo"]["estimated_bpm"]),
@@ -136,7 +117,6 @@ def process_one(
         style_profile=style_profile,
         show_overlay=show_overlay,
         enable_beat_editing=enable_beat_editing,
-        subtitles=subtitles,
     )
 
     run_report = {
@@ -146,7 +126,6 @@ def process_one(
         "preprocessing": heartbeat_summary,
         "emotion": emotion_report,
         "video_metadata": video_meta,
-        "chinese_cover": cover_report,
         "mix_report": mix_report,
         "video_report": video_report,
         "outputs": {

@@ -6,13 +6,12 @@ LegaSynth 把一段**心跳录音**和一段**英文歌曲音乐视频（.mp4）
 
 网页 App 现在有两个标签页：
 
-- **🎬 Heartbeat music video（完整流程）**：上传心跳 `.wav/.mp3` + 歌曲 `.mp4`，一键生成并下载 `final_video.mp4` / `final_audio.wav/mp3`。包含三个核心功能：
+- **🎬 Heartbeat music video（完整流程）**：上传心跳 `.wav/.mp3` + 歌曲 `.mp4`，一键生成并下载 `final_video.mp4` / `final_audio.wav/mp3`。**保留歌曲原声**，把心跳作为鼓点铺底，并做两项视频处理：
   - **A · 情绪调色**：从心跳的心率 / 心率变异性（HRV）估计情绪（valence/arousal），自动决定视频的色温、饱和度、对比度、暗角和剪辑节奏。*（启发式艺术映射，非医疗诊断。）*
   - **B · 心跳驱动剪辑**：视频随心跳"呼吸"——每拍缩放脉冲、强拍闪白、按心率每 N 拍一个剪辑重音。
-  - **C · 中文翻唱**：分离原唱、按旋律把中文歌词用 `edge-tts` 合成演唱并替换人声（advanced feature：lyrics sung in Chinese）。
 - **🔬 Stage 1 · heartbeat analysis**：只做心跳音频分析（预处理、节拍检测、BPM、稳定 loop、诊断图/报告）；本文件第 4 节起主要讲这部分参数与调优。
 
-命令行 [scripts/process_files.py](scripts/process_files.py) 同时支持 Stage-1 批处理和完整音乐视频流程（`--heartbeat X --video Y [--chinese-cover ...]`，见第 5 节）。完整流程各功能与实现细节见 [FEATURES.md](FEATURES.md)。
+命令行 [scripts/process_files.py](scripts/process_files.py) 同时支持 Stage-1 批处理和完整音乐视频流程（`--heartbeat X --video Y`，见第 5 节）。完整流程各功能与实现细节见 [FEATURES.md](FEATURES.md)。
 
 ## 1. 功能概览
 
@@ -766,12 +765,11 @@ D:\Heartbeat
   heartbeat_preprocessor/
     core.py                      心跳音频预处理、BPM、peak、loop、导出逻辑
   legasynth/
-    pipeline.py                  完整流程编排：Stage1 -> 情绪 -> 混音 -> 中文翻唱 -> 视频
+    pipeline.py                  完整流程编排：Stage1 -> 情绪 -> 混音（原声+心跳）-> 视频
     emotion.py                   功能 A：心跳 -> 情绪(valence/arousal) -> 视觉风格
     video_audio.py               从 mp4 提取歌曲音频并估计歌曲 BPM/beat
     mixing.py                    心跳 loop time-stretch 到歌曲 BPM 并混音
     video_render.py              功能 B：心跳驱动的调色 / 缩放脉冲 / 闪白 / 按拍剪辑
-    chinese_cover.py             功能 C：人声分离 -> 旋律 -> edge-tts 中文演唱 -> 混音
   scripts/
     process_files.py             命令行入口（Stage-1 批处理 + 完整音乐视频流程）
   environment.yml                conda 环境定义
@@ -784,26 +782,24 @@ D:\Heartbeat
 
 ## 12. 完整音乐视频流程（已实现）
 
-完整流程已经落地，端到端把心跳 + 歌曲 mp4 变成 `final_video.mp4`：
+完整流程已经落地，端到端把心跳 + 歌曲 mp4 变成 `final_video.mp4`，**保留歌曲原声、心跳作鼓点铺底**：
 
 - 上传英文歌曲音乐视频 `.mp4`，提取歌曲音频、估计歌曲 BPM 和 beat track
-- 将 `best_loop.wav` time-stretch 到歌曲 BPM，混合心跳和歌曲音频
+- 将 `best_loop.wav` time-stretch 到歌曲 BPM，铺在歌曲原声下方混音（不替换人声）
 - 生成心跳驱动的视觉效果，导出 `final_video.mp4`
 
-三个进阶功能（advanced features）：
+两个进阶功能（advanced features）：
 
 - **A 情绪条件化（emotional conditioning）**：心跳 HRV -> 情绪 -> 视频调色与剪辑节奏（[legasynth/emotion.py](legasynth/emotion.py)）
 - **B 心跳驱动剪辑**：随心跳缩放/闪白/按拍剪辑（[legasynth/video_render.py](legasynth/video_render.py)）
-- **C 中文翻唱 + 人声分离（Chinese lyrics singing / vocal separation）**：卡拉OK中置消除分离原唱，按旋律用 edge-tts 合成中文演唱替换人声（[legasynth/chinese_cover.py](legasynth/chinese_cover.py)）
 
-未来可继续增强的方向（见各模块 `future_work`）：音节级音高对齐、可唱的 EN→ZH 翻译、神经歌声合成（DiffSinger 等）、Demucs 高质量分离、AI 视频生成。
+未来可继续增强的方向：句首献词标题卡、角落心率徽标、主歌/副歌自适应特效、剪辑拍柔性转场。
 
-命令行示例（完整流程 + 中文翻唱）：
+命令行示例（完整流程）：
 
 ```powershell
 conda run -n heartbeat python scripts\process_files.py `
   --heartbeat "C:\path\heartbeat.wav" `
   --video "C:\path\song.mp4" `
-  --out outputs\mv `
-  --chinese-cover --chinese-lyrics "C:\path\lyrics_zh.txt" --voice zh-CN-XiaoxiaoNeural
+  --out outputs\mv --title "For Mom"
 ```

@@ -34,12 +34,12 @@
     -c:v libx264 -pix_fmt yuv420p -c:a aac -ac 2 real_mv.mp4
   ```
 
-> 说明：该 MV 人声本身是中文，用于验证管线机制（分离 / 旋律 / 演唱合成 / 混音 / A+B 视频处理）完全没问题。功能 C 的"英文→中文翻唱"在真实英文歌上更贴题，demo 时用你自己的英文歌 MV + 提供中文歌词即可。
+> 说明：该 MV 用于验证完整管线（提取歌曲音频 / 心跳对齐混音 / A 情绪调色 / B 心跳剪辑）。保留歌曲原声、心跳作鼓点铺底，不做人声分离或翻唱。demo 时换成你自己最爱的英文歌 MV 即可。
 
 ## 3. 更多可选来源
 
 - 心音：PASCAL Heart Sounds Challenge;CirCor DigiScope 2022（PhysioNet）。
-- CC 音乐/视频：Wikimedia Commons（`Category:Music videos`，逐个核对许可证）、Free Music Archive（CC-BY 歌曲，含人声与歌词，适合翻唱 demo）、Pixabay/Pexels（CC0 视频片段）。
+- CC 音乐/视频：Wikimedia Commons（`Category:Music videos`，逐个核对许可证）、Free Music Archive（CC-BY 歌曲）、Pixabay/Pexels（CC0 视频片段）。
 
 引用：
 [PhysioNet 2016](https://physionet.org/content/challenge-2016/1.0.0/) ·

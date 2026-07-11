@@ -298,9 +298,7 @@ def run_full_pipeline(
     enable_emotion: bool,
     enable_beat_editing: bool,
     show_overlay: bool,
-    enable_subtitles: bool,
     duration_limit: float | None,
-    cover_options: dict | None,
 ) -> list[dict]:
     reports: list[dict] = []
     run_root = Path("outputs") / ("mv_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -313,9 +311,7 @@ def run_full_pipeline(
     for i, hb in enumerate(heartbeat_files):
         status.write(
             f"Processing {hb.name} ({i + 1}/{len(heartbeat_files)}) — "
-            "heartbeat analysis, mixing, styling, encode"
-            + (", plus online Chinese singing" if cover_options else "")
-            + "…"
+            "heartbeat analysis, mixing, styling, encode…"
         )
         hb_path = tmp_dir / hb.name
         hb_path.write_bytes(hb.getvalue())
@@ -332,8 +328,6 @@ def run_full_pipeline(
                 enable_emotion=enable_emotion,
                 enable_beat_editing=enable_beat_editing,
                 show_overlay=show_overlay,
-                enable_subtitles=enable_subtitles,
-                chinese_cover_options=cover_options,
             )
             reports.append(report)
         except Exception as exc:
@@ -358,16 +352,6 @@ def render_pipeline_report(report: dict) -> None:
         cols[4].metric("Grade / cut", f"{style['grade_name']} · {style['beats_per_cut']}b")
         st.caption(emotion["disclaimer"])
 
-    cover = report.get("chinese_cover")
-    if cover:
-        synth = cover["synthesis"]
-        st.write(
-            f"**Chinese cover:** {synth['tts_lines']} line(s) sung with `{synth['voice']}` "
-            f"via `{synth['synthesis_backend']}` · separation `{cover['separation']['method']}`"
-        )
-        for w in cover.get("notes", {}).get("warnings", []):
-            st.warning(w)
-
     final_video = _read_bytes(report["outputs"]["final_video_mp4"])
     if final_video:
         st.video(final_video)
@@ -390,18 +374,16 @@ def render_pipeline_report(report: dict) -> None:
         dl[3].download_button("all_outputs.zip", zp, file_name=f"{stem}_all_outputs.zip",
                               mime="application/zip", key=f"{stem}_zip_full")
 
-    with st.expander("Diagnostic reports (emotion / cover)"):
+    with st.expander("Diagnostic report (emotion)"):
         if emotion:
             st.json(emotion)
-        if cover:
-            st.json(cover)
 
 
 def full_pipeline_tab(params: ProcessingParams) -> None:
     st.write(
         "Upload one or more **heartbeat** recordings and one **English music video (.mp4)**. "
-        "The app aligns and mixes the heartbeat into the song, styles the video by the heart's "
-        "emotion (A), cuts it to the heartbeat (B), and can re-sing the lyrics in Chinese (C)."
+        "The app keeps the song's original audio, lays the heartbeat under it as a rhythmic bed, "
+        "styles the video by the heart's emotion (A), and cuts it to the heartbeat (B)."
     )
 
     up_cols = st.columns(2)
@@ -420,43 +402,11 @@ def full_pipeline_tab(params: ProcessingParams) -> None:
     duration_limit = o3.number_input("Duration limit (s, 0 = full)", 0.0, 600.0, 0.0, 5.0, key="mv_dur")
     title_text = st.text_input("Title / dedication overlay", value="", key="mv_title")
 
-    f1, f2, f3, f4 = st.columns(4)
+    f1, f2, f3 = st.columns(3)
     enable_emotion = f1.checkbox("A · Emotion styling", value=True, key="mv_emotion")
     enable_beat_editing = f2.checkbox("B · Heartbeat-driven cuts", value=True, key="mv_beat")
-    enable_subtitles = f3.checkbox("Chinese lyric subtitles", value=True, key="mv_subs",
-                                   help="Burn karaoke-style Chinese lyric lines (requires the Chinese cover below).")
-    show_overlay = f4.checkbox("Diagnostic overlay (debug)", value=False, key="mv_overlay",
+    show_overlay = f3.checkbox("Diagnostic overlay (debug)", value=False, key="mv_overlay",
                                help="Show the heartbeat waveform / BPM HUD. Off for a clean, natural music video.")
-
-    st.markdown("#### C · Chinese cover (lyrics sung in Chinese)")
-    enable_cover = st.checkbox("Enable Chinese cover", value=False, key="mv_cover")
-    cover_options = None
-    if enable_cover:
-        c1, c2 = st.columns([2, 1])
-        lyrics = c1.text_area(
-            "Chinese lyrics (one line per lyric line). Leave empty to only strip the original vocal.",
-            value="", height=140, key="mv_lyrics",
-            placeholder="我有一个梦想\n一首歌在心中\n随着心跳起舞",
-        )
-        lrc = c1.text_area(
-            "Optional timed LRC ([mm:ss.xx] per line) — overrides even spacing.",
-            value="", height=90, key="mv_lrc",
-        )
-        voice = c2.selectbox(
-            "Chinese voice",
-            ["zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural", "zh-CN-YunyangNeural",
-             "zh-CN-XiaoyiNeural", "zh-CN-liaoning-XiaobeiNeural"],
-            key="mv_voice",
-        )
-        vocal_gain = c2.slider("Cover vocal gain (dB)", -12.0, 6.0, -2.0, 1.0, key="mv_vocgain")
-        c2.caption("Chinese singing uses edge-tts online. Requires internet access.")
-        cover_options = {
-            "enabled": True,
-            "lyrics": lyrics or None,
-            "lrc": lrc or None,
-            "voice": voice,
-            "vocal_gain_db": vocal_gain,
-        }
 
     can_run = bool(heartbeat_files) and video_file is not None
     if not can_run:
@@ -467,8 +417,8 @@ def full_pipeline_tab(params: ProcessingParams) -> None:
         with st.spinner("Rendering… this can take a while for long videos."):
             reports = run_full_pipeline(
                 heartbeat_files, video_file, params, effect_strength, heartbeat_gain_db,
-                title_text, enable_emotion, enable_beat_editing, show_overlay, enable_subtitles,
-                duration_limit if duration_limit > 0 else None, cover_options,
+                title_text, enable_emotion, enable_beat_editing, show_overlay,
+                duration_limit if duration_limit > 0 else None,
             )
         st.session_state["mv_reports"] = reports
 

@@ -182,41 +182,6 @@ def draw_text(frame: np.ndarray, bpm: float, title_text: str, mood: str, strengt
         _outlined_text(frame, title_text[:60], (24, y), 0.72, (235, 235, 235), 2)
 
 
-def active_subtitle(t: float, subtitles: list[dict] | None) -> tuple[str, float]:
-    """Return (text, alpha) for the lyric line active at time t, with fade in/out."""
-    if not subtitles:
-        return "", 0.0
-    fade = 0.28
-    for line in subtitles:
-        start, end = float(line["start"]), float(line["end"])
-        if start <= t <= end:
-            a = min((t - start) / fade, (end - t) / fade, 1.0)
-            return str(line.get("text", "")), float(max(0.0, a))
-    return "", 0.0
-
-
-def draw_subtitle(frame: np.ndarray, text: str, alpha: float) -> None:
-    """Karaoke-style centred lyric with a translucent backdrop and fade."""
-    if not text or alpha <= 0.02:
-        return
-    h, w = frame.shape[:2]
-    scale = max(0.7, w / 1100.0)
-    thickness = max(2, int(round(scale * 2)))
-    (tw, th), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
-    # CJK glyphs are wider than getTextSize reports for the Hershey font; pad by an estimate.
-    tw = max(tw, int(len(text) * 26 * scale))
-    x = (w - tw) // 2
-    y = int(h * 0.88)
-    pad = int(14 * scale)
-    x0, y0 = max(0, x - pad), max(0, y - th - pad)
-    x1, y1 = min(w, x + tw + pad), min(h, y + base + pad)
-    box_alpha = 0.45 * alpha
-    frame[y0:y1, x0:x1] = (frame[y0:y1, x0:x1] * (1.0 - box_alpha)).astype(np.uint8)
-    col = int(245 * alpha)
-    cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
-    cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (col, col, col), thickness, cv2.LINE_AA)
-
-
 def mux_audio(video_no_audio: Path, audio_path: Path, final_path: Path) -> None:
     cmd = [
         imageio_ffmpeg.get_ffmpeg_exe(),
@@ -251,7 +216,6 @@ def render_heartbeat_video(
     style_profile: dict[str, Any] | None = None,
     show_overlay: bool = False,
     enable_beat_editing: bool = True,
-    subtitles: list[dict] | None = None,
 ) -> dict[str, Any]:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -317,10 +281,6 @@ def render_heartbeat_video(
             draw_waveform(out_frame, wave, phase, pulse)
             draw_text(out_frame, heartbeat_bpm, title_text, str(style.get("mood_zh") or style.get("mood", "")), pulse)
 
-        sub_text, sub_alpha = active_subtitle(t, subtitles)
-        if sub_text:
-            draw_subtitle(out_frame, sub_text, sub_alpha)
-
         writer.write(out_frame)
         frame_index += 1
 
@@ -347,7 +307,6 @@ def render_heartbeat_video(
         "beats_per_cut": int(style["beats_per_cut"]),
         "cut_accent_count": int(len(cut_beats)),
         "overlay_shown": bool(show_overlay),
-        "subtitle_lines": int(len(subtitles)) if subtitles else 0,
         "grade_name": style.get("grade_name"),
         "mood": style.get("mood"),
         "style_profile": style,

@@ -24,25 +24,7 @@ def main() -> None:
     parser.add_argument("--no-emotion", action="store_true", help="Disable Feature A emotion-driven styling")
     parser.add_argument("--no-beat-editing", action="store_true", help="Disable Feature B heartbeat-driven cuts")
     parser.add_argument("--overlay", action="store_true", help="Show the diagnostic waveform/BPM overlay (off by default for a clean MV)")
-    parser.add_argument("--no-subtitles", action="store_true", help="Do not burn Chinese lyric subtitles")
-    parser.add_argument("--chinese-cover", action="store_true", help="Enable Feature C Chinese cover")
-    parser.add_argument("--chinese-lyrics", help="Path to a UTF-8 text file with Chinese lyrics (one line per lyric line)")
-    parser.add_argument("--chinese-lrc", help="Path to a timed .lrc file for the Chinese lyrics")
-    parser.add_argument("--voice", default="zh-CN-XiaoxiaoNeural", help="edge-tts Chinese voice name")
-    parser.add_argument("--cover-vocal-gain-db", type=float, default=-2.0, help="Chinese cover vocal gain in dB")
     args = parser.parse_args()
-
-    cover_options = None
-    if args.chinese_cover:
-        lyrics_text = Path(args.chinese_lyrics).read_text(encoding="utf-8") if args.chinese_lyrics else None
-        lrc_text = Path(args.chinese_lrc).read_text(encoding="utf-8") if args.chinese_lrc else None
-        cover_options = {
-            "enabled": True,
-            "lyrics": lyrics_text,
-            "lrc": lrc_text,
-            "voice": args.voice,
-            "vocal_gain_db": args.cover_vocal_gain_db,
-        }
 
     params = ProcessingParams(target_loop_beats=args.loop_beats)
     out = Path(args.out)
@@ -62,8 +44,6 @@ def main() -> None:
                 enable_emotion=not args.no_emotion,
                 enable_beat_editing=not args.no_beat_editing,
                 show_overlay=args.overlay,
-                enable_subtitles=not args.no_subtitles,
-                chinese_cover_options=cover_options,
             )
             print(
                 f"{Path(heartbeat).name}: final_video={report['outputs']['final_video_mp4']}, "
