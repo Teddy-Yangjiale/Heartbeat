@@ -112,7 +112,7 @@ def render_result(result: dict, save_outputs: bool) -> dict | None:
         f"median correlation: {tempo['template_median_correlation']}."
     )
 
-    st.image(result["artifacts"]["diagnostic_plot.png"], caption="Diagnostic plot", use_container_width=True)
+    st.image(result["artifacts"]["diagnostic_plot.png"], caption="Diagnostic plot", width='stretch')
 
     audio_cols = st.columns(3)
     audio_cols[0].write("Cleaned heartbeat audio")
@@ -163,8 +163,8 @@ def render_result(result: dict, save_outputs: bool) -> dict | None:
         st.json(summary)
     with st.expander("Recording-quality reasons and loop candidates"):
         st.json(recording_quality)
-        st.dataframe(result["loop_candidates"], use_container_width=True)
-        st.dataframe(result["template_analysis"], use_container_width=True)
+        st.dataframe(result["loop_candidates"], width='stretch')
+        st.dataframe(result["template_analysis"], width='stretch')
 
     with st.expander("Manual beat and loop correction"):
         st.caption("Edit beat times in seconds, then optionally set an exact loop range. The exports will be regenerated.")
@@ -176,7 +176,7 @@ def render_result(result: dict, save_outputs: bool) -> dict | None:
         edited_beats = st.data_editor(
             pd.DataFrame({"time_seconds": result["beat_times"]}),
             num_rows="dynamic",
-            use_container_width=True,
+            width='stretch',
             key=f"{key_prefix}_manual_beats",
         )
         loop_cols = st.columns(2)
