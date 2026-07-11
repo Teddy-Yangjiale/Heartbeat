@@ -280,6 +280,10 @@ conda run -n heartbeat python scripts\process_files.py "C:\path\heartbeat.wav" -
 
 候选 loop 的质量排名。除 `regularity_score` 外，还包含 `envelope_snr_db` 和 `quality_score`。系统优先选择规则性高、心音峰相对背景更清晰的候选，而不是只按 IBI 方差排序。
 
+### `template_analysis.csv` 和 `heartbeat_template.csv`
+
+模板确认的可解释数据。`heartbeat_template.csv` 是由候选心拍中位数得到的归一化波形；`template_analysis.csv` 给出每个候选的相关性、是否匹配模板、是否最终保留和决定原因。为避免漏拍，只有候选数明显高于 BPM 预期时，模板才会删除不匹配的峰；否则只记录相似度并保留节拍序列。
+
 每个输入音频会生成以下文件。
 
 ### `tempo_summary.json`

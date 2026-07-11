@@ -44,6 +44,11 @@ def sidebar_params() -> ProcessingParams:
         "Strong": {"hpss_margin": 2.8, "spectral_reduction_strength": 1.45, "between_beat_attenuation_db": -36.0, "beat_gate_post_ms": 340.0},
     }
     speech_suppression_params = profiles[suppression_profile]
+    st.sidebar.subheader("Heartbeat template confirmation")
+    template_enabled = st.sidebar.checkbox("Confirm beats with heartbeat template", value=True)
+    template_threshold = st.sidebar.slider(
+        "Template correlation threshold", 0.10, 0.90, 0.35, 0.05, disabled=not template_enabled
+    )
     return ProcessingParams(
         bandpass_low_hz=low,
         bandpass_high_hz=high,
@@ -56,6 +61,8 @@ def sidebar_params() -> ProcessingParams:
         target_loop_beats=loop_beats,
         crossfade_ms=crossfade_ms,
         enable_speech_suppression=suppression_enabled,
+        enable_template_confirmation=template_enabled,
+        template_correlation_threshold=template_threshold,
         **speech_suppression_params,
     )
 
@@ -98,6 +105,10 @@ def render_result(result: dict) -> None:
     st.caption(
         f"BPM method: {tempo['method']}; consensus windows: "
         f"{tempo['consensus_window_count']}/{tempo['window_count']}."
+    )
+    st.caption(
+        f"Template confirmation: {tempo['template_confirmed_beats']}/{tempo['initial_detected_beats']} beats; "
+        f"median correlation: {tempo['template_median_correlation']}."
     )
 
     st.image(result["artifacts"]["diagnostic_plot.png"], caption="Diagnostic plot", use_container_width=True)
@@ -152,6 +163,7 @@ def render_result(result: dict) -> None:
     with st.expander("Recording-quality reasons and loop candidates"):
         st.json(recording_quality)
         st.dataframe(result["loop_candidates"], use_container_width=True)
+        st.dataframe(result["template_analysis"], use_container_width=True)
 
 
 def main() -> None:

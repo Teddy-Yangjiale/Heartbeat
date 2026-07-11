@@ -4,6 +4,7 @@ import numpy as np
 
 from heartbeat_preprocessor.core import (
     ProcessingParams,
+    confirm_beats_with_template,
     estimate_bpm_with_consensus,
     rank_loop_candidates,
 )
@@ -49,6 +50,22 @@ class RobustAnalysisTest(unittest.TestCase):
         self.assertGreaterEqual(len(candidates), 2)
         self.assertGreaterEqual(selected["quality_score"], candidates[-1]["quality_score"])
         self.assertLess(selected["regularity_score"], 0.05)
+
+    def test_template_confirmation_preserves_plausible_beat_count(self) -> None:
+        sample_rate = 100
+        beats = np.asarray([0.8, 1.8, 2.8, 3.8, 4.8], dtype=np.float32)
+        signal_data = pulse_envelope(sample_rate, 6.0, beats)
+        confirmed, info, analysis, template = confirm_beats_with_template(
+            signal_data,
+            beats,
+            sample_rate,
+            expected_period_seconds=1.0,
+            params=ProcessingParams(template_correlation_threshold=0.8),
+        )
+        self.assertEqual(len(confirmed), len(beats))
+        self.assertEqual(info["method"], "kept_timing_complete")
+        self.assertEqual(len(analysis), len(beats))
+        self.assertGreater(len(template), 0)
 
 
 if __name__ == "__main__":

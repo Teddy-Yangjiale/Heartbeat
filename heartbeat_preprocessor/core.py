@@ -49,6 +49,11 @@ class ProcessingParams:
     analysis_window_hop_seconds: float = 3.0
     min_consensus_windows: int = 2
     loop_candidate_count: int = 5
+    enable_template_confirmation: bool = True
+    template_pre_ms: float = 90.0
+    template_post_ms: float = 300.0
+    template_correlation_threshold: float = 0.35
+    min_template_beats: int = 4
 
 
 def safe_stem(name: str) -> str:
@@ -85,7 +90,10 @@ def process_audio_bytes(
     filtered = suppress_non_heart_content(band_limited, sr, params)
     envelope = extract_envelope(filtered, sr, params.envelope_lowpass_hz)
     bpm_info, window_analysis = estimate_bpm_with_consensus(envelope, sr, params)
-    beat_times = detect_beats(envelope, sr, bpm_info["period_seconds"], params)
+    candidate_beat_times = detect_beats(envelope, sr, bpm_info["period_seconds"], params)
+    beat_times, template_info, template_analysis, template_waveform = confirm_beats_with_template(
+        filtered, candidate_beat_times, sr, bpm_info["period_seconds"], params
+    )
     ibi = np.diff(beat_times)
     loop_info, loop_candidates = rank_loop_candidates(
         beat_times,
@@ -106,7 +114,7 @@ def process_audio_bytes(
 
     quality = compute_quality(mono, cleaned, sr, source_info, params, beat_times)
     recording_quality = assess_recording_quality(
-        mono, filtered, envelope, beat_times, sr, bpm_info, window_analysis, quality
+        mono, filtered, envelope, beat_times, sr, bpm_info, window_analysis, quality, template_info
     )
     tempo_summary = build_summary(
         filename=filename,
@@ -119,6 +127,7 @@ def process_audio_bytes(
         beat_times=beat_times,
         ibi=ibi,
         loop_info={**loop_info, **loop_audio_info},
+        template_info=template_info,
         params=params,
     )
 
@@ -128,6 +137,14 @@ def process_audio_bytes(
     ibi_df = make_ibi_frame(beat_times)
     window_analysis_df = pd.DataFrame(window_analysis)
     loop_candidates_df = pd.DataFrame(loop_candidates)
+    template_analysis_df = pd.DataFrame(template_analysis)
+    template_waveform_df = pd.DataFrame(
+        {
+            "relative_time_seconds": np.arange(len(template_waveform), dtype=np.float32) / sr
+            - params.template_pre_ms / 1000.0,
+            "normalized_amplitude": template_waveform,
+        }
+    )
     diagnostic_png = make_diagnostic_plot(
         stem=stem,
         raw=mono,
@@ -139,6 +156,7 @@ def process_audio_bytes(
         loop_info=loop_info,
         ibi=ibi,
         bpm_info=bpm_info,
+        template_analysis=template_analysis,
     )
 
     artifacts = {
@@ -150,6 +168,8 @@ def process_audio_bytes(
         "envelope.csv": envelope_df.to_csv(index=False).encode("utf-8"),
         "window_analysis.csv": window_analysis_df.to_csv(index=False).encode("utf-8"),
         "loop_candidates.csv": loop_candidates_df.to_csv(index=False).encode("utf-8"),
+        "template_analysis.csv": template_analysis_df.to_csv(index=False).encode("utf-8"),
+        "heartbeat_template.csv": template_waveform_df.to_csv(index=False).encode("utf-8"),
         "recording_quality.json": json.dumps(recording_quality, indent=2).encode("utf-8"),
         "cleaned.wav": wav_bytes(sr, cleaned_audio),
         "filtered_detection.wav": wav_bytes(sr, filtered_audio),
@@ -169,6 +189,7 @@ def process_audio_bytes(
         "ibi": ibi,
         "window_analysis": window_analysis,
         "loop_candidates": loop_candidates,
+        "template_analysis": template_analysis,
         "loop_audio": loop_audio,
         "summary": tempo_summary,
         "recording_quality": recording_quality,
@@ -206,6 +227,8 @@ def make_markdown_report(summary: dict[str, Any]) -> str:
         f"- Autocorrelation confidence: {tempo['autocorr_confidence']:.6f}",
         f"- BPM method: {tempo['method']}",
         f"- Consensus windows: {tempo['consensus_window_count']}/{tempo['window_count']}",
+        f"- Template-confirmed beats: {tempo['template_confirmed_beats']}/{tempo['initial_detected_beats']}",
+        f"- Template median correlation: {tempo['template_median_correlation']}",
         f"- Detected beats: {tempo['detected_beats']}",
         f"- Median-IBI BPM: {tempo['picked_bpm_from_median_ibi']}",
         f"- IBI mean: {tempo['ibi_mean_seconds']}",
@@ -549,6 +572,110 @@ def detect_beats(
     return times.astype(np.float32)
 
 
+def confirm_beats_with_template(
+    signal_data: np.ndarray,
+    candidate_times: np.ndarray,
+    sr: int,
+    expected_period_seconds: float,
+    params: ProcessingParams,
+) -> tuple[np.ndarray, dict[str, Any], list[dict[str, Any]], np.ndarray]:
+    candidates = np.asarray(candidate_times, dtype=np.float32)
+    pre = max(1, int(params.template_pre_ms * sr / 1000.0))
+    post = max(1, int(params.template_post_ms * sr / 1000.0))
+    width = pre + post
+    segments: list[np.ndarray] = []
+    valid_indices: list[int] = []
+    for index, time_seconds in enumerate(candidates):
+        center = int(round(float(time_seconds) * sr))
+        start = center - pre
+        end = center + post
+        if start < 0 or end > len(signal_data):
+            continue
+        segment = signal_data[start:end].astype(np.float32)
+        segment = segment - float(np.mean(segment))
+        norm = float(np.linalg.norm(segment))
+        if norm <= 1e-8:
+            continue
+        segments.append(segment / norm)
+        valid_indices.append(index)
+
+    analysis = [
+        {
+            "candidate_index": int(index),
+            "time_seconds": float(time_seconds),
+            "correlation": None,
+            "is_template_match": True,
+            "is_confirmed": True,
+            "decision": "not_applied",
+        }
+        for index, time_seconds in enumerate(candidates)
+    ]
+    empty_template = np.zeros(width, dtype=np.float32)
+    if not params.enable_template_confirmation:
+        return candidates, _template_info(False, len(candidates), len(candidates), None, "disabled"), analysis, empty_template
+    if len(segments) < params.min_template_beats:
+        return candidates, _template_info(True, len(candidates), len(candidates), None, "insufficient_candidates"), analysis, empty_template
+
+    template = np.median(np.stack(segments), axis=0).astype(np.float32)
+    template -= float(np.mean(template))
+    template_norm = float(np.linalg.norm(template))
+    if template_norm <= 1e-8:
+        return candidates, _template_info(True, len(candidates), len(candidates), None, "degenerate_template"), analysis, empty_template
+    template /= template_norm
+
+    correlations = np.full(len(candidates), np.nan, dtype=np.float32)
+    for source_index, segment in zip(valid_indices, segments):
+        correlations[source_index] = float(np.dot(segment, template))
+    valid_correlations = correlations[np.isfinite(correlations)]
+    adaptive_threshold = float(np.percentile(valid_correlations, 20))
+    threshold = max(float(params.template_correlation_threshold), adaptive_threshold)
+    template_match_mask = np.isfinite(correlations) & (correlations >= threshold)
+    expected_count = len(signal_data) / max(1, sr) / max(expected_period_seconds, 1e-6)
+    minimum_retained = max(params.min_template_beats, int(math.floor(expected_count * 0.8)))
+    candidate_count_is_plausible = len(candidates) <= math.ceil(expected_count * 1.10)
+    if candidate_count_is_plausible:
+        confirmed_mask = np.ones(len(candidates), dtype=bool)
+        decision = "kept_timing_complete"
+    elif int(np.sum(template_match_mask)) < minimum_retained:
+        confirmed_mask = np.ones(len(candidates), dtype=bool)
+        decision = "kept_fallback_would_under_detect"
+    else:
+        confirmed_mask = template_match_mask
+        decision = "template_confirmed"
+
+    for index, row in enumerate(analysis):
+        correlation = correlations[index]
+        row["correlation"] = float(correlation) if np.isfinite(correlation) else None
+        row["is_template_match"] = bool(template_match_mask[index]) if np.isfinite(correlation) else False
+        row["is_confirmed"] = bool(confirmed_mask[index])
+        row["decision"] = decision if np.isfinite(correlation) else "edge_window_unavailable"
+    confirmed = candidates[confirmed_mask]
+    info = _template_info(
+        True,
+        len(candidates),
+        len(confirmed),
+        float(np.median(valid_correlations)) if len(valid_correlations) else None,
+        decision,
+    )
+    info["correlation_threshold"] = threshold
+    info["expected_beat_count"] = expected_count
+    info["minimum_retained_beats"] = minimum_retained
+    return confirmed.astype(np.float32), info, analysis, template
+
+
+def _template_info(
+    enabled: bool, candidate_count: int, confirmed_count: int, median_correlation: float | None, method: str
+) -> dict[str, Any]:
+    return {
+        "enabled": bool(enabled),
+        "candidate_count": int(candidate_count),
+        "confirmed_count": int(confirmed_count),
+        "confirmation_fraction": float(confirmed_count / candidate_count) if candidate_count else 0.0,
+        "median_correlation": median_correlation,
+        "method": method,
+    }
+
+
 def choose_best_loop(
     beat_times: np.ndarray, duration: float, target_loop_beats: int, fallback_period: float
 ) -> dict[str, Any]:
@@ -748,6 +875,7 @@ def assess_recording_quality(
     bpm_info: dict[str, Any],
     window_analysis: list[dict[str, Any]],
     base_quality: dict[str, Any],
+    template_info: dict[str, Any],
 ) -> dict[str, Any]:
     """Produce a conservative recording-usability score, not a medical diagnosis."""
     reasons: list[str] = []
@@ -786,6 +914,10 @@ def assess_recording_quality(
     if envelope_spread < 0.12:
         score -= 12.0
         reasons.append("Heartbeat envelope has low contrast against the residual background.")
+    if template_info["enabled"] and template_info["candidate_count"] >= 4:
+        if template_info["confirmation_fraction"] < 0.6:
+            score -= 12.0
+            reasons.append("Many candidate beats do not match the learned heartbeat template.")
 
     score = float(np.clip(score, 0.0, 100.0))
     if score >= 75.0:
@@ -809,6 +941,7 @@ def assess_recording_quality(
             "envelope_contrast": envelope_spread,
             "window_count": window_count,
             "consensus_window_count": consensus_windows,
+            "template_confirmation_fraction": template_info["confirmation_fraction"],
         },
     }
 
@@ -824,6 +957,7 @@ def build_summary(
     beat_times: np.ndarray,
     ibi: np.ndarray,
     loop_info: dict[str, Any],
+    template_info: dict[str, Any],
     params: ProcessingParams,
 ) -> dict[str, Any]:
     return {
@@ -841,7 +975,12 @@ def build_summary(
             "ibi_mean_seconds": float(np.mean(ibi)) if len(ibi) else None,
             "ibi_std_seconds": float(np.std(ibi)) if len(ibi) else None,
             "picked_bpm_from_median_ibi": float(60.0 / np.median(ibi)) if len(ibi) else None,
+            "initial_detected_beats": int(template_info["candidate_count"]),
+            "template_confirmed_beats": int(template_info["confirmed_count"]),
+            "template_confirmation_fraction": template_info["confirmation_fraction"],
+            "template_median_correlation": template_info["median_correlation"],
         },
+        "template_confirmation": template_info,
         "best_loop": loop_info,
         "parameters": asdict(params),
     }
@@ -905,6 +1044,7 @@ def make_diagnostic_plot(
     loop_info: dict[str, Any],
     ibi: np.ndarray,
     bpm_info: dict[str, float],
+    template_analysis: list[dict[str, Any]],
 ) -> bytes:
     fig, axes = plt.subplots(5, 1, figsize=(12, 11), sharex=False)
     fig.suptitle(f"Heartbeat preprocessing diagnostics: {stem}")
@@ -914,8 +1054,10 @@ def make_diagnostic_plot(
 
     t_env = np.arange(len(envelope)) / sr if len(envelope) else np.array([])
     axes[3].plot(t_env, envelope, linewidth=0.8, color="#2c7fb8")
-    for bt in beat_times:
-        axes[3].axvline(float(bt), color="#e34a33", alpha=0.4, linewidth=0.8)
+    for item in template_analysis:
+        color = "#e34a33" if item["is_confirmed"] else "#969696"
+        style = "-" if item["is_confirmed"] else "--"
+        axes[3].axvline(float(item["time_seconds"]), color=color, alpha=0.5, linewidth=0.8, linestyle=style)
     axes[3].axvspan(loop_info["start_seconds"], loop_info["end_seconds"], color="#31a354", alpha=0.2)
     axes[3].set_title("Envelope, detected beats, and selected loop")
     axes[3].set_ylabel("Envelope")
