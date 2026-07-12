@@ -1,6 +1,25 @@
-# LegaSynth 完整流程与两大功能（A / B）
+# LegaSynth 功能说明
 
-本文件说明「心跳音乐视频」完整流程里的两个进阶功能。总编排在 [legasynth/pipeline.py](legasynth/pipeline.py) 的 `process_one()`：
+## 核心功能：治疗师协作式短片段候选生成
+
+核心实现位于 [legasynth/phrase_generator.py](legasynth/phrase_generator.py)，研究定义见 [PROJECT_DIRECTION.md](PROJECT_DIRECTION.md)。
+
+```text
+心跳 beat times / IBI -> personal rhythm contour ----+
+患者选择的 ordered scale degrees --------------------+-> constrained symbolic generator
+治疗师 key / mode / tempo / bars / influence --------+          |
+                                                               4 candidates
+                                                                  |
+                                                      WAV preview + editable MIDI
+```
+
+当前生成器提供四种有明确差异的候选策略：`Pulse motif`、`Call and response`、`Expanded arc`、`Spacious variation`。每条候选都输出 WAV 试听、MIDI、note-event CSV；全部候选连同 manifest 可打包下载。
+
+心跳只作为节奏素材，不用于推断患者情绪。生成结果是供治疗师和患者选择、拒绝、组合和继续即兴的未完成草稿，不是最终作品。
+
+## Legacy：心跳音乐视频实验
+
+以下功能是项目转向前完成的旧实验，代码继续保留用于复现，但不再属于核心研究问题。总编排在 [legasynth/pipeline.py](legasynth/pipeline.py) 的 `process_one()`：
 
 ```
 心跳 wav ──► Stage-1 分析（BPM / beat_times / best_loop）

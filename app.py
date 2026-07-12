@@ -13,45 +13,50 @@ from heartbeat_preprocessor.core import (
     process_audio_bytes,
     save_result_to_dir,
 )
+from legasynth.phrase_generator import (
+    KEY_OFFSETS,
+    SCALES,
+    PhraseRequest,
+    generate_phrase_candidates,
+    parse_anchor_degrees,
+)
 from legasynth.pipeline import process_one
 
 
-st.set_page_config(page_title="LegaSynth Heartbeat Music Video", layout="wide")
+st.set_page_config(page_title="LegaSynth Co-Composition Studio", layout="wide")
 
 
 def sidebar_params() -> ProcessingParams:
-    st.sidebar.header("Preprocessing Parameters")
-    low = st.sidebar.slider("Band-pass low cutoff (Hz)", 5.0, 80.0, 25.0, 1.0)
-    high = st.sidebar.slider("Band-pass high cutoff (Hz)", 80.0, 500.0, 160.0, 5.0)
-    env_lp = st.sidebar.slider("Envelope low-pass (Hz)", 2.0, 20.0, 6.0, 0.5)
-    min_bpm = st.sidebar.slider("Minimum plausible BPM", 30.0, 80.0, 40.0, 1.0)
-    max_bpm = st.sidebar.slider("Maximum plausible BPM", 90.0, 180.0, 140.0, 1.0)
-    prominence = st.sidebar.slider("Peak prominence", 0.01, 0.60, 0.12, 0.01)
-    height_pct = st.sidebar.slider("Peak height percentile", 40.0, 90.0, 65.0, 1.0)
-    double_peak_suppression = st.sidebar.slider("Double-peak suppression", 0.40, 0.90, 0.65, 0.01)
-    loop_beats = st.sidebar.slider("Target loop length (beats)", 2, 12, 4, 1)
-    crossfade_ms = st.sidebar.slider("Loop edge fade (ms)", 0.0, 80.0, 12.0, 1.0)
+    with st.sidebar.expander("Advanced heartbeat timing settings", expanded=False):
+        low = st.slider("Band-pass low cutoff (Hz)", 5.0, 80.0, 25.0, 1.0)
+        high = st.slider("Band-pass high cutoff (Hz)", 80.0, 500.0, 160.0, 5.0)
+        env_lp = st.slider("Envelope low-pass (Hz)", 2.0, 20.0, 6.0, 0.5)
+        min_bpm = st.slider("Minimum plausible BPM", 30.0, 80.0, 40.0, 1.0)
+        max_bpm = st.slider("Maximum plausible BPM", 90.0, 180.0, 140.0, 1.0)
+        prominence = st.slider("Peak prominence", 0.01, 0.60, 0.12, 0.01)
+        height_pct = st.slider("Peak height percentile", 40.0, 90.0, 65.0, 1.0)
+        double_peak_suppression = st.slider("Double-peak suppression", 0.40, 0.90, 0.65, 0.01)
 
-    st.sidebar.subheader("Speech and noise suppression")
-    suppression_enabled = st.sidebar.checkbox("Enable speech/noise suppression", value=True)
-    suppression_profile = st.sidebar.select_slider(
-        "Suppression strength",
-        options=["Mild", "Balanced", "Strong"],
-        value="Balanced",
-        disabled=not suppression_enabled,
-        help="Strong mode removes more talking between heartbeats, but can make weak S1/S2 sounds quieter.",
-    )
-    profiles = {
-        "Mild": {"hpss_margin": 1.4, "spectral_reduction_strength": 0.85, "between_beat_attenuation_db": -18.0, "beat_gate_post_ms": 260.0},
-        "Balanced": {"hpss_margin": 2.0, "spectral_reduction_strength": 1.15, "between_beat_attenuation_db": -28.0, "beat_gate_post_ms": 300.0},
-        "Strong": {"hpss_margin": 2.8, "spectral_reduction_strength": 1.45, "between_beat_attenuation_db": -36.0, "beat_gate_post_ms": 340.0},
-    }
-    speech_suppression_params = profiles[suppression_profile]
-    st.sidebar.subheader("Heartbeat template confirmation")
-    template_enabled = st.sidebar.checkbox("Confirm beats with heartbeat template", value=True)
-    template_threshold = st.sidebar.slider(
-        "Template correlation threshold", 0.10, 0.90, 0.35, 0.05, disabled=not template_enabled
-    )
+        st.subheader("Speech and noise suppression")
+        suppression_enabled = st.checkbox("Enable speech/noise suppression", value=True)
+        suppression_profile = st.select_slider(
+            "Suppression strength",
+            options=["Mild", "Balanced", "Strong"],
+            value="Balanced",
+            disabled=not suppression_enabled,
+            help="Strong mode removes more talking between heartbeats, but can make weak S1/S2 sounds quieter.",
+        )
+        profiles = {
+            "Mild": {"hpss_margin": 1.4, "spectral_reduction_strength": 0.85, "between_beat_attenuation_db": -18.0, "beat_gate_post_ms": 260.0},
+            "Balanced": {"hpss_margin": 2.0, "spectral_reduction_strength": 1.15, "between_beat_attenuation_db": -28.0, "beat_gate_post_ms": 300.0},
+            "Strong": {"hpss_margin": 2.8, "spectral_reduction_strength": 1.45, "between_beat_attenuation_db": -36.0, "beat_gate_post_ms": 340.0},
+        }
+        speech_suppression_params = profiles[suppression_profile]
+        st.subheader("Heartbeat template confirmation")
+        template_enabled = st.checkbox("Confirm beats with heartbeat template", value=True)
+        template_threshold = st.slider(
+            "Template correlation threshold", 0.10, 0.90, 0.35, 0.05, disabled=not template_enabled
+        )
     return ProcessingParams(
         bandpass_low_hz=low,
         bandpass_high_hz=high,
@@ -61,8 +66,6 @@ def sidebar_params() -> ProcessingParams:
         peak_prominence=prominence,
         peak_height_percentile=height_pct,
         double_peak_suppression=double_peak_suppression,
-        target_loop_beats=loop_beats,
-        crossfade_ms=crossfade_ms,
         enable_speech_suppression=suppression_enabled,
         enable_template_confirmation=template_enabled,
         template_correlation_threshold=template_threshold,
@@ -278,7 +281,142 @@ def stage1_tab(params: ProcessingParams, save_outputs: bool) -> None:
 
 
 # =====================================================================================
-# Full pipeline: heartbeat-inspired music video (Features A + B + C)
+# Primary workflow: short musical idea candidates for therapist-patient co-composition
+# =====================================================================================
+
+
+def render_phrase_candidates(result: dict, heartbeat_result: dict) -> None:
+    summary = heartbeat_result["summary"]
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Detected heartbeat", f"{result['source_heartbeat_bpm']:.1f} BPM")
+    metric_cols[1].metric("Candidate tempo", f"{result['tempo_bpm']:.1f} BPM")
+    metric_cols[2].metric("Reliable beats", str(summary["tempo"]["detected_beats"]))
+    metric_cols[3].metric("Candidate ideas", str(len(result["candidates"])))
+    st.caption(
+        "Heartbeat timing was used as compositional material, not as an emotion diagnosis. "
+        "Choose, reject, combine, or improvise on any candidate with the patient."
+    )
+
+    for index, candidate in enumerate(result["candidates"]):
+        with st.container(border=True):
+            title_col, info_col = st.columns([2, 3])
+            title_col.subheader(f"{index + 1}. {candidate['name']}")
+            info_col.write(candidate["rationale"])
+            st.audio(candidate["wav_bytes"], format="audio/wav")
+            actions = st.columns(3)
+            actions[0].download_button(
+                "Download MIDI",
+                candidate["midi_bytes"],
+                file_name=f"{candidate['id']}.mid",
+                mime="audio/midi",
+                key=f"{candidate['id']}_midi",
+            )
+            actions[1].download_button(
+                "Download WAV preview",
+                candidate["wav_bytes"],
+                file_name=f"{candidate['id']}.wav",
+                mime="audio/wav",
+                key=f"{candidate['id']}_wav",
+            )
+            actions[2].caption(
+                f"{candidate['note_count']} note events · {candidate['duration_seconds']:.1f}s"
+            )
+
+    st.download_button(
+        "Download all editable candidates",
+        result["zip_bytes"],
+        file_name="legasynth_phrase_candidates.zip",
+        mime="application/zip",
+        type="primary",
+        key="phrase_all_zip",
+    )
+
+
+def phrase_candidates_tab(params: ProcessingParams) -> None:
+    st.write(
+        "Generate several short musical starting points for a therapist and patient to shape together. "
+        "The output is deliberately unfinished: editable MIDI plus a simple WAV preview."
+    )
+
+    heartbeat_file = st.file_uploader(
+        "Heartbeat recording (.wav / .mp3)",
+        type=["wav", "mp3"],
+        accept_multiple_files=False,
+        key="phrase_heartbeat",
+    )
+
+    st.markdown("#### Patient-provided musical material")
+    patient_cols = st.columns([2, 3])
+    anchor_text = patient_cols[0].text_input(
+        "Chosen scale degrees",
+        value="4, 2, 7",
+        help="Keep the patient's order and meaning. Use numbers 1 to 7, separated by commas.",
+        key="phrase_anchors",
+    )
+    patient_cols[1].text_area(
+        "Meaning or story notes",
+        value="",
+        placeholder="Optional session notes for the therapist. These stay in the interface and are not interpreted by the generator.",
+        key="phrase_story",
+    )
+
+    st.markdown("#### Therapist controls")
+    row1 = st.columns(4)
+    key = row1[0].selectbox("Key", list(KEY_OFFSETS), index=0, key="phrase_key")
+    scale = row1[1].selectbox("Scale", list(SCALES), index=0, key="phrase_scale")
+    intention = row1[2].selectbox(
+        "Working character",
+        ["Reflective", "Grounded", "Hopeful", "Spacious"],
+        index=0,
+        key="phrase_intention",
+    )
+    bars = row1[3].selectbox("Length", [2, 4, 8], index=1, format_func=lambda value: f"{value} bars", key="phrase_bars")
+
+    row2 = st.columns(3)
+    tempo_mode = row2[0].selectbox(
+        "Tempo source", ["Use heartbeat BPM", "Set manually"], index=0, key="phrase_tempo_mode"
+    )
+    manual_tempo = row2[1].slider(
+        "Manual tempo (BPM)", 40, 160, 72, 1, disabled=tempo_mode == "Use heartbeat BPM", key="phrase_tempo"
+    )
+    influence = row2[2].slider(
+        "Heartbeat rhythm influence", 0.0, 1.0, 0.65, 0.05, key="phrase_influence"
+    )
+
+    if heartbeat_file is None:
+        st.info("Upload a heartbeat recording to generate candidate ideas.")
+        return
+
+    if st.button("Generate candidate ideas", type="primary", key="phrase_generate"):
+        try:
+            anchor_degrees = parse_anchor_degrees(anchor_text)
+            heartbeat_result = process_audio_bytes(heartbeat_file.name, heartbeat_file.getvalue(), params)
+            phrase_request = PhraseRequest(
+                key=key,
+                scale=scale,
+                bars=bars,
+                tempo_bpm=None if tempo_mode == "Use heartbeat BPM" else float(manual_tempo),
+                anchor_degrees=anchor_degrees,
+                intention=intention,
+                candidate_count=4,
+                heartbeat_influence=float(influence),
+            )
+            phrase_result = generate_phrase_candidates(
+                heartbeat_result["summary"], heartbeat_result["beat_times"], phrase_request
+            )
+            st.session_state["phrase_result"] = phrase_result
+            st.session_state["phrase_heartbeat_result"] = heartbeat_result
+        except Exception as exc:
+            st.error(f"Could not generate candidates: {exc}")
+
+    phrase_result = st.session_state.get("phrase_result")
+    heartbeat_result = st.session_state.get("phrase_heartbeat_result")
+    if phrase_result and heartbeat_result:
+        render_phrase_candidates(phrase_result, heartbeat_result)
+
+
+# =====================================================================================
+# Legacy workflow: heartbeat-inspired music video (Features A + B + C)
 # =====================================================================================
 
 def _read_bytes(path: str | None) -> bytes | None:
@@ -431,15 +569,20 @@ def full_pipeline_tab(params: ProcessingParams) -> None:
 
 
 def main() -> None:
-    st.title("LegaSynth · Heartbeat-Inspired Music Video")
+    st.title("LegaSynth · Therapist Co-Composition Studio")
+    st.caption("Heartbeat-informed musical prompts for therapist-patient co-creation")
     params = sidebar_params()
     save_outputs = st.sidebar.checkbox("Also save outputs to D:\\Heartbeat\\outputs", value=True)
 
-    tab_mv, tab_stage1 = st.tabs(["🎬 Heartbeat music video", "🔬 Stage 1 · heartbeat analysis"])
-    with tab_mv:
-        full_pipeline_tab(params)
+    tab_phrases, tab_stage1, tab_mv = st.tabs(
+        ["Musical idea candidates", "Heartbeat timing analysis", "Legacy MV experiment"]
+    )
+    with tab_phrases:
+        phrase_candidates_tab(params)
     with tab_stage1:
         stage1_tab(params, save_outputs)
+    with tab_mv:
+        full_pipeline_tab(params)
 
 
 if __name__ == "__main__":

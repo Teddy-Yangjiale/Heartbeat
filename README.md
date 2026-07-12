@@ -1,19 +1,38 @@
-# Heartbeat / LegaSynth
+# Heartbeat / LegaSynth Co-Composition Studio
 
 Repository: [Teddy-Yangjiale/Heartbeat](https://github.com/Teddy-Yangjiale/Heartbeat)
 
-LegaSynth 把一段**心跳录音**和一段**英文歌曲音乐视频（.mp4）**，自动合成为一支**个性化的心跳音乐视频**。
+LegaSynth 的核心方向已调整为：为音乐治疗师和患者共同作曲时，快速生成多条**短音乐片段候选**。系统使用患者选择的音级、心跳时序和治疗师设定的音乐约束，输出可试听的 WAV 草稿和可继续编辑的 MIDI。
 
-网页 App 现在有两个标签页：
+它不是自动作曲治疗师，也不根据心跳诊断情绪。最终选择、修改、即兴和作品归属始终由治疗师与患者共同决定。完整研究定义、范围边界和评价方案见 [PROJECT_DIRECTION.md](PROJECT_DIRECTION.md)。
 
-- **🎬 Heartbeat music video（完整流程）**：上传心跳 `.wav/.mp3` + 歌曲 `.mp4`，一键生成并下载 `final_video.mp4` / `final_audio.wav/mp3`。**保留歌曲原声**，把心跳作为鼓点铺底，并做两项视频处理：
-  - **A · 情绪调色**：从心跳的心率 / 心率变异性（HRV）估计情绪（valence/arousal），自动决定视频的色温、饱和度、对比度、暗角和剪辑节奏。*（启发式艺术映射，非医疗诊断。）*
-  - **B · 心跳驱动剪辑**：视频随心跳"呼吸"——每拍缩放脉冲、强拍闪白、按心率每 N 拍一个剪辑重音。
-- **🔬 Stage 1 · heartbeat analysis**：只做心跳音频分析（预处理、节拍检测、BPM、稳定 loop、诊断图/报告）；本文件第 4 节起主要讲这部分参数与调优。
+网页 App 现在有三个标签页：
 
-命令行 [scripts/process_files.py](scripts/process_files.py) 同时支持 Stage-1 批处理和完整音乐视频流程（`--heartbeat X --video Y`，见第 5 节）。完整流程各功能与实现细节见 [FEATURES.md](FEATURES.md)。
+- **Musical idea candidates（核心流程）**：输入一段心跳、患者选择的音级顺序，以及 key/mode/tempo/长度等治疗师控制；生成 4 条不同策略的 2–8 小节候选，并导出 WAV、MIDI、note CSV 和生成 manifest。
+- **Heartbeat timing analysis（支持工具）**：查看预处理、节拍检测、BPM/IBI 和录音质量，供技术校验使用。
+- **Legacy MV experiment（旧实验）**：保留原有心跳音乐视频功能用于已有成果复现，但不再属于核心研究问题。
 
-## 1. 功能概览
+候选生成实现在 [legasynth/phrase_generator.py](legasynth/phrase_generator.py)，当前采用透明、可复现的 symbolic baseline。旧 MV 流程仍由 [scripts/process_files.py](scripts/process_files.py) 和 [legasynth/pipeline.py](legasynth/pipeline.py) 保留。
+
+## 1. 新核心流程
+
+```text
+心跳录音 -> BPM / beat times / IBI timing contour ----+
+患者选择音级 -> ordered anchor motif -----------------+-> 4 条短片段候选
+治疗师控制 -> key / mode / tempo / length / influence -+       |
+                                                            WAV 试听 + MIDI 编辑
+```
+
+当前四种候选策略：
+
+- `Pulse motif`：最清楚地保留心跳时序轮廓；
+- `Call and response`：重复患者 motif，再给出小幅回应变化；
+- `Expanded arc`：把 motif 扩展成较长的上行与回归乐句；
+- `Spacious variation`：增加留白，为现场钢琴、吉他或人声即兴保留空间。
+
+核心流程不负责自动选 production loop、后期混音、完整歌曲生成、视频、中文翻唱或最终乐谱转写。
+
+## 2. 心跳分析功能概览
 
 输入：
 
@@ -57,7 +76,7 @@ heartbeat .wav/.mp3
 -> export JSON / CSV / WAV / PNG / ZIP
 ```
 
-### 1.1 面对说话声和环境噪声的预处理
+### 2.1 面对说话声和环境噪声的预处理
 
 听诊器录音不是纯心音：讲话、空调、手持摩擦和低频振动都可能被录入。当前版本默认启用 `Speech and noise suppression`，处理链路为：
 
@@ -74,9 +93,9 @@ DC removal
 
 这是一种 CPU-only 的信号处理方案，不是通用的人声分离模型。若讲话声刚好与 S1/S2 同时发生，单支听诊器麦克风没有独立参考信号，无法保证完全移除而不伤害心音。此时应优先使用 `Strong`，或重新安静录一段至少 10-15 秒的素材。
 
-## 2. 从零开始启动
+## 3. 从零开始启动
 
-### 2.1 安装基础软件
+### 3.1 安装基础软件
 
 需要 Windows + conda。推荐安装 Anaconda 或 Miniconda。
 
@@ -88,7 +107,7 @@ conda --version
 
 如果能看到版本号，例如 `conda 25.x.x`，说明 conda 可用。
 
-### 2.2 获取项目
+### 3.2 获取项目
 
 如果你还没有本地代码：
 
@@ -104,7 +123,7 @@ cd Heartbeat
 cd /d D:\Heartbeat
 ```
 
-### 2.3 创建或更新 conda 环境
+### 3.3 创建或更新 conda 环境
 
 项目默认使用 conda 环境名：
 
@@ -145,9 +164,9 @@ imageio-ffmpeg
 
 第一阶段主要使用 `numpy`、`scipy`、`pandas`、`matplotlib`、`streamlit`、`librosa` 和 `soundfile`。音视频相关包保留给后续阶段。
 
-## 3. 启动 Web App
+## 4. 启动 Web App
 
-### 3.1 本机模式
+### 4.1 本机模式
 
 ```powershell
 run_app.bat
@@ -161,7 +180,7 @@ http://127.0.0.1:8501
 
 这个模式只适合本机访问。
 
-### 3.2 局域网 / 虚拟网卡模式
+### 4.2 局域网 / 虚拟网卡模式
 
 ```powershell
 run_app_lan.bat
@@ -197,7 +216,7 @@ ipconfig
 - 访问的是否是正确的虚拟网卡 IPv4
 - 对方设备是否和该虚拟网卡网络互通
 
-### 3.3 为什么启动脚本带这些参数
+### 4.3 为什么启动脚本带这些参数
 
 当前启动脚本使用：
 
@@ -215,25 +234,29 @@ python -m streamlit
 - `--no-capture-output`：让 `conda run` 不吞掉 Streamlit 的长驻输出，减少启动失败。
 - `python -m streamlit`：通过当前 conda 环境里的 Python 调用 Streamlit，避免 `streamlit.exe` 包装路径差异。
 
-## 4. Web App 使用方法
+## 5. Web App 使用方法
 
-1. 打开页面。
-2. 在左侧参数区选择处理参数。
-3. 在上传区选择一个或多个 `.wav` / `.mp3` 心跳音频。
-4. 点击 `Process uploaded files`。
-5. 页面会显示每个文件的：
-   - duration
-   - sample rate
-   - estimated BPM
-   - detected beats
-   - IBI std
-   - peak dBFS
-   - best loop 起止时间
-   - diagnostic plot
-   - cleaned audio preview
-   - filtered detection audio preview
-   - best loop audio preview
-6. 下载单文件结果 ZIP，或下载所有文件的 batch ZIP。
+核心候选生成流程：
+
+1. 打开 `Musical idea candidates` 标签页。
+2. 上传一个 `.wav` / `.mp3` 心跳录音。
+3. 按患者选择的顺序输入音级，例如 `4, 2, 7`；故事说明只供治疗师查看，不会交给生成器解释。
+4. 设置 key、scale、tempo、2/4/8 小节长度、working character 和 heartbeat influence。
+5. 点击 `Generate candidate ideas`。
+6. 对比试听四条候选；可分别下载 MIDI/WAV，也可下载包含全部候选、note CSV 和 manifest 的 ZIP。
+
+技术校验可进入 `Heartbeat timing analysis` 标签页。页面会显示每个文件的：
+
+- duration
+- sample rate
+- estimated BPM
+- detected beats
+- IBI std
+- peak dBFS
+- diagnostic plot
+- cleaned audio preview
+- filtered detection audio preview
+并可下载单文件结果 ZIP，或下载所有文件的 batch ZIP。
 
 如果勾选保存输出，结果会写入：
 
@@ -243,7 +266,7 @@ outputs/YYYYMMDD_HHMMSS/
 
 每个输入文件会有一个子目录。
 
-## 5. 命令行使用方法
+## 6. 命令行使用方法
 
 单个文件：
 
@@ -273,7 +296,7 @@ conda run -n heartbeat python scripts\process_files.py `
 conda run -n heartbeat python scripts\process_files.py "C:\path\heartbeat.wav" --out outputs\stage1 --loop-beats 6
 ```
 
-## 6. 输出文件说明
+## 7. 心跳分析输出文件说明
 
 ### `recording_quality.json`
 
@@ -422,7 +445,7 @@ peak detection 主要是在 envelope 上做的。
 - 绿色 loop 区间是否稳定
 - envelope 是否过平或噪声过多
 
-## 7. 参数说明与调整建议
+## 8. 参数说明与调整建议
 
 ### `Band-pass low cutoff (Hz)`
 
@@ -629,7 +652,7 @@ peak detection 主要是在 envelope 上做的。
 - 有 click：调到 `20-40 ms`。
 - 心跳 transient 很重要：保持 `5-12 ms`。
 
-## 7.1 语音和噪声抑制参数
+## 8.1 语音和噪声抑制参数
 
 ### `Enable speech/noise suppression`
 
@@ -651,7 +674,7 @@ peak detection 主要是在 envelope 上做的。
 
 诊断图现在有五部分：原始波形、抑制语音后的检测信号、最终 cleaned 音频、envelope/beat/loop，以及 local BPM。页面还会显示 `Beat-window coverage`，表示有多少录音时长处在保留心音的时间窗内。
 
-## 8. 如何判断结果好不好
+## 9. 如何判断结果好不好
 
 推荐检查顺序：
 
@@ -662,7 +685,7 @@ peak detection 主要是在 envelope 上做的。
 5. 试听 `best_loop.wav`，确认 loop 没有明显断裂或爆音。
 6. 如果检测不准，优先调 `Peak prominence`、`Double-peak suppression` 和 BPM 范围。
 
-## 9. 已验证样例
+## 10. 已验证样例
 
 本地已在 `heartbeat` conda 环境验证：
 
@@ -686,7 +709,7 @@ C:\Users\33480\Desktop\20260710231622\202607091053425340.wav
 stage1_mp3_validation_input.mp3: BPM=69.6, beats=15
 ```
 
-## 10. 常见问题
+## 11. 常见问题
 
 ### Streamlit 要求输入 email，然后 bat 失败
 
@@ -757,14 +780,16 @@ http://虚拟网卡IPv4:8501
 - 换更长或更短的 `Target loop length`
 - 检查原始录音是否有突发噪声
 
-## 11. 项目结构
+## 12. 项目结构
 
 ```text
 D:\Heartbeat
-  app.py                         Streamlit Web App（音乐视频 + Stage 1 两个标签页）
+  app.py                         Streamlit Web App（候选生成 + 心跳分析 + Legacy MV）
+  PROJECT_DIRECTION.md           新研究问题、范围边界和评价方案
   heartbeat_preprocessor/
     core.py                      心跳音频预处理、BPM、peak、loop、导出逻辑
   legasynth/
+    phrase_generator.py          核心：短片段候选、WAV/MIDI/manifest 导出
     pipeline.py                  完整流程编排：Stage1 -> 情绪 -> 混音（原声+心跳）-> 视频
     emotion.py                   功能 A：心跳 -> 情绪(valence/arousal) -> 视觉风格
     video_audio.py               从 mp4 提取歌曲音频并估计歌曲 BPM/beat
@@ -772,6 +797,8 @@ D:\Heartbeat
     video_render.py              功能 B：心跳驱动的调色 / 缩放脉冲 / 闪白 / 按拍剪辑
   scripts/
     process_files.py             命令行入口（Stage-1 批处理 + 完整音乐视频流程）
+  tests/
+    test_phrase_generator.py     候选差异性、确定性、WAV/MIDI/ZIP 测试
   environment.yml                conda 环境定义
   requirements.txt               pip 依赖列表
   setup_env.bat                  创建或更新 heartbeat 环境
@@ -780,7 +807,7 @@ D:\Heartbeat
   outputs/                       本地输出目录，不上传 Git
 ```
 
-## 12. 完整音乐视频流程（已实现）
+## 13. Legacy 音乐视频流程（已实现）
 
 完整流程已经落地，端到端把心跳 + 歌曲 mp4 变成 `final_video.mp4`，**保留歌曲原声、心跳作鼓点铺底**：
 
