@@ -1,0 +1,110 @@
+{
+  "purpose": "Short musical idea candidates for therapist-patient co-composition",
+  "scope_note": "These are editable prompts, not finished compositions or clinical recommendations. The therapist and patient retain selection and authorship.",
+  "request": {
+    "key": "C",
+    "scale": "Major",
+    "bars": 4,
+    "tempo_bpm": null,
+    "anchor_degrees": [
+      4,
+      2,
+      7
+    ],
+    "intention": "Reflective",
+    "candidate_count": 4,
+    "heartbeat_influence": 0.65
+  },
+  "heartbeat_rhythm_pattern_beats": [
+    0.75,
+    0.75,
+    1.5,
+    1.5,
+    1.0,
+    1.0,
+    0.75,
+    1.5
+  ],
+  "candidates": [
+    {
+      "id": "candidate_01",
+      "name": "Pulse motif",
+      "rationale": "Keeps the heartbeat timing contour most clearly.",
+      "tempo_bpm": 69.03721455786851,
+      "source_heartbeat_bpm": 69.03721455786851,
+      "heartbeat_influence": 0.65,
+      "patient_anchor_degrees": [
+        4,
+        2,
+        7
+      ],
+      "note_count": 32,
+      "duration_seconds": 13.905543642629251,
+      "files": {
+        "audio_preview": "candidate_01.wav",
+        "editable_midi": "candidate_01.mid",
+        "note_events": "candidate_01_notes.csv"
+      }
+    },
+    {
+      "id": "candidate_02",
+      "name": "Call and response",
+      "rationale": "Repeats the patient motif, then answers it with a small variation.",
+      "tempo_bpm": 69.03721455786851,
+      "source_heartbeat_bpm": 69.03721455786851,
+      "heartbeat_influence": 0.65,
+      "patient_anchor_degrees": [
+        4,
+        2,
+        7
+      ],
+      "note_count": 32,
+      "duration_seconds": 13.905543642629251,
+      "files": {
+        "audio_preview": "candidate_02.wav",
+        "editable_midi": "candidate_02.mid",
+        "note_events": "candidate_02_notes.csv"
+      }
+    },
+    {
+      "id": "candidate_03",
+      "name": "Expanded arc",
+      "rationale": "Stretches the motif into a longer rising and returning phrase.",
+      "tempo_bpm": 69.03721455786851,
+      "source_heartbeat_bpm": 69.03721455786851,
+      "heartbeat_influence": 0.65,
+      "patient_anchor_degrees": [
+        4,
+        2,
+        7
+      ],
+      "note_count": 27,
+      "duration_seconds": 13.905543642629251,
+      "files": {
+        "audio_preview": "candidate_03.wav",
+        "editable_midi": "candidate_03.mid",
+        "note_events": "candidate_03_notes.csv"
+      }
+    },
+    {
+      "id": "candidate_04",
+      "name": "Spacious variation",
+      "rationale": "Uses more rests and leaves room for live improvisation.",
+      "tempo_bpm": 69.03721455786851,
+      "source_heartbeat_bpm": 69.03721455786851,
+      "heartbeat_influence": 0.65,
+      "patient_anchor_degrees": [
+        4,
+        2,
+        7
+      ],
+      "note_count": 22,
+      "duration_seconds": 13.905543642629251,
+      "files": {
+        "audio_preview": "candidate_04.wav",
+        "editable_midi": "candidate_04.mid",
+        "note_events": "candidate_04_notes.csv"
+      }
+    }
+  ]
+}
