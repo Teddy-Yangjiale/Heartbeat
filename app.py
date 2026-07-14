@@ -29,6 +29,14 @@ def sidebar_params() -> ProcessingParams:
     double_peak_suppression = st.sidebar.slider("Double-peak suppression", 0.40, 0.90, 0.65, 0.01)
     loop_beats = st.sidebar.slider("Target loop length (beats)", 2, 12, 4, 1)
     crossfade_ms = st.sidebar.slider("Loop edge fade (ms)", 0.0, 80.0, 12.0, 1.0)
+    export_peak_dbfs = st.sidebar.slider(
+        "Export output peak (dBFS)",
+        -24.0,
+        -0.1,
+        -1.94,
+        0.1,
+        help="Higher values are louder. -0.1 dBFS is the loudest setting and retains a small margin below digital clipping.",
+    )
 
     st.sidebar.subheader("Speech and noise suppression")
     suppression_enabled = st.sidebar.checkbox("Enable speech/noise suppression", value=True)
@@ -61,6 +69,7 @@ def sidebar_params() -> ProcessingParams:
         double_peak_suppression=double_peak_suppression,
         target_loop_beats=loop_beats,
         crossfade_ms=crossfade_ms,
+        export_peak_dbfs=export_peak_dbfs,
         enable_speech_suppression=suppression_enabled,
         enable_template_confirmation=template_enabled,
         template_correlation_threshold=template_threshold,

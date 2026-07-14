@@ -23,6 +23,9 @@ from scipy import signal
 from scipy.io import wavfile
 
 
+DEFAULT_EXPORT_PEAK_DBFS = 20.0 * math.log10(0.8)
+
+
 @dataclass(frozen=True)
 class ProcessingParams:
     bandpass_low_hz: float = 25.0
@@ -37,6 +40,7 @@ class ProcessingParams:
     crossfade_ms: float = 12.0
     zero_crossing_search_ms: float = 20.0
     export_envelope_hz: float = 100.0
+    export_peak_dbfs: float = DEFAULT_EXPORT_PEAK_DBFS
     enable_speech_suppression: bool = True
     hpss_margin: float = 2.0
     spectral_noise_percentile: float = 15.0
@@ -133,10 +137,11 @@ def process_audio_bytes(
     cleaned = apply_beat_synchronous_gate(filtered, sr, beat_times, params)
     loop_audio, loop_audio_info = cut_loop(cleaned, sr, loop_info, params)
 
-    # Export the gated version as well: users should not hear residual talk in a diagnostic WAV.
-    filtered_audio = normalize_for_wav(cleaned, target_peak=0.8)
-    cleaned_audio = normalize_for_wav(cleaned, target_peak=0.8)
-    loop_audio = normalize_for_wav(loop_audio, target_peak=0.8)
+    # Use one headroom-preserving target for every exported WAV.
+    export_target_peak = peak_from_dbfs(params.export_peak_dbfs)
+    filtered_audio = normalize_for_wav(cleaned, target_peak=export_target_peak)
+    cleaned_audio = normalize_for_wav(cleaned, target_peak=export_target_peak)
+    loop_audio = normalize_for_wav(loop_audio, target_peak=export_target_peak)
 
     quality = compute_quality(mono, cleaned, sr, source_info, params, beat_times)
     recording_quality = assess_recording_quality(
@@ -1071,6 +1076,12 @@ def dbfs(value: float) -> float:
 
 def format_optional_score(value: float | None) -> str:
     return "manual selection" if value is None else f"{value:.1f}/100"
+
+
+def peak_from_dbfs(dbfs: float) -> float:
+    """Convert a requested export peak to linear amplitude with clipping headroom."""
+    safe_dbfs = min(float(dbfs), -0.1)
+    return float(10.0 ** (safe_dbfs / 20.0))
 
 
 def normalize_for_wav(x: np.ndarray, target_peak: float = 0.8) -> np.ndarray:
