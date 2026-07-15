@@ -102,4 +102,14 @@ conda run --no-capture-output -n heartbeat python -m unittest discover -s tests 
 
 客观指标只负责排除明显损伤，最终听感仍需要用同一输入做身份隐藏的盲听。`scripts/create_blind_ab_pack.py` 会验证三份 WAV 的采样率、声道数和帧数完全一致，随机分配 A/B，生成评分表，并把答案表放在试听目录之外。A/B 已被实际试听否决后，应把新候选作为 C 与原始输入、旧 v1 重新比较，而不是继续调高旧候选的增益。
 
+盲听前可用 `scripts/compare_candidate_outputs.py` 做完整同长度输出的客观预筛。它先在受保护心音区域对齐增益，再比较心音波形、起音、20–250 Hz 频谱分布、心搏重检、削波和心搏间隙，因此不会把“整段调低音量”误判为降噪。候选只需相对输入达到至少 8 dB 的间隙衰减，同时不损伤心音；不要求比 v1 更安静，因为过度静音本身可能造成低沉、削薄和节奏丢失。
+
+```powershell
+conda run --no-capture-output -n heartbeat python scripts\compare_candidate_outputs.py `
+  --case sample reference.wav v1.wav candidate.wav `
+  --output outputs\candidate_prescreen.json
+```
+
+预筛通过仍不等于听感胜出；最终接受门槛仍由身份隐藏盲听决定。
+
 评分完成后使用 `scripts/analyze_blind_ab_scores.py 评分表.csv 私有答案表.json` 揭盲。判定门槛要求 S1/S2 饱满度、起音、节奏和伪影指标均不能比 v1 退步，同时空间噪声或摩擦声至少一项改善；缺失或超出 1–5 范围的评分会被拒绝。
