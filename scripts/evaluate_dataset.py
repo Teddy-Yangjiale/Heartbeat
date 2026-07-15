@@ -55,8 +55,10 @@ def evaluate_file(path: Path, window_seconds: float) -> dict:
     summary = result["summary"]
     quality = summary["quality"]
     recording = summary["recording_quality"]
+    recording_metrics = recording["metrics"]
     cycle = result["cycle_consistency"]
     rhythm = result["rhythm_preservation"]
+    focal = result["focal_cycle_contamination"]
     cleanest_segment = result["cleanest_segment"]
     playback = cleanest_segment["playback_loudness"]
     annotation_mask = annotated_s1s2_mask(path, sr, start_seconds, len(audio_segment))
@@ -76,6 +78,13 @@ def evaluate_file(path: Path, window_seconds: float) -> dict:
         "denoising_status": recording["denoising_status"],
         "needs_rerecording": recording["needs_rerecording"],
         "quality_score": recording["score"],
+        "quality_reasons": " | ".join(recording["reasons"]),
+        "template_median_correlation": recording_metrics.get(
+            "template_median_correlation"
+        ),
+        "ibi_coefficient_of_variation": recording_metrics.get(
+            "ibi_coefficient_of_variation"
+        ),
         "cycle_applied": cycle["applied"],
         "cycles_used": cycle["cycles_used"],
         "median_cycle_correlation": cycle["median_cycle_correlation"],
@@ -86,6 +95,11 @@ def evaluate_file(path: Path, window_seconds: float) -> dict:
         "rhythm_absolute_count_delta_fraction": rhythm["absolute_count_delta_fraction"],
         "rhythm_median_timing_error_ms": rhythm["median_timing_error_ms"],
         "rhythm_median_ibi_error_fraction": rhythm["median_ibi_error_fraction"],
+        "focal_severe_cycle_count": focal["severe_cycle_count"],
+        "focal_severe_cycle_fraction": focal["severe_cycle_fraction"],
+        "focal_max_rms_ratio": focal["max_rms_ratio"],
+        "focal_max_peak_ratio": focal["max_peak_ratio"],
+        "focal_minimum_template_correlation": focal["minimum_template_correlation"],
         "cleanest_segment_is_fallback": cleanest_segment["is_fallback"],
         "cleanest_segment_quality_score": cleanest_segment["quality_score"],
         "cleanest_segment_contrast_db": cleanest_segment["heart_to_gap_contrast_db"],
@@ -126,6 +140,8 @@ def main() -> None:
     status_counts = Counter(row["denoising_status"] for row in rows)
     numeric_fields = (
         "quality_score",
+        "template_median_correlation",
+        "ibi_coefficient_of_variation",
         "median_cycle_correlation",
         "cycle_outlier_fraction",
         "rhythm_matched_fraction",
@@ -133,6 +149,11 @@ def main() -> None:
         "rhythm_absolute_count_delta_fraction",
         "rhythm_median_timing_error_ms",
         "rhythm_median_ibi_error_fraction",
+        "focal_severe_cycle_count",
+        "focal_severe_cycle_fraction",
+        "focal_max_rms_ratio",
+        "focal_max_peak_ratio",
+        "focal_minimum_template_correlation",
         "cleanest_segment_quality_score",
         "cleanest_segment_contrast_db",
         "cleanest_segment_gap_rms_dbfs",
@@ -191,6 +212,11 @@ def main() -> None:
         ),
         "rhythm_failure_fraction": (
             float(sum(not bool(row["rhythm_is_preserved"]) for row in rows) / len(rows))
+            if rows
+            else None
+        ),
+        "focal_contamination_fraction": (
+            float(sum(int(row["focal_severe_cycle_count"]) > 0 for row in rows) / len(rows))
             if rows
             else None
         ),

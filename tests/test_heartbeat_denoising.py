@@ -8,6 +8,7 @@ from heartbeat_preprocessor.core import (
     ProcessingParams,
     assess_recording_quality,
     cycle_consistency_denoise,
+    measure_focal_cycle_contamination,
     measure_rhythm_preservation,
     process_audio_bytes,
 )
@@ -126,6 +127,7 @@ class HeartbeatDenoisingTest(unittest.TestCase):
             "cleanest_segment_candidates.csv",
             "cycle_consistency.json",
             "rhythm_preservation.json",
+            "focal_cycle_contamination.json",
             "postprocess_beat_times.csv",
             "recording_quality.json",
         ):
@@ -149,6 +151,42 @@ class HeartbeatDenoisingTest(unittest.TestCase):
         self.assertTrue(rhythm["is_preserved"])
         self.assertGreaterEqual(rhythm["matched_fraction"], 0.95)
         self.assertEqual(rhythm["count_delta"], 0)
+        self.assertEqual(result["focal_cycle_contamination"]["severe_cycle_count"], 0)
+
+    def test_isolated_high_energy_non_template_cycle_is_flagged(self) -> None:
+        sr = 8000
+        seconds = 12
+        beats = np.arange(0.8, seconds - 0.5, 0.8)
+        clean = np.zeros(sr * seconds, dtype=np.float32)
+        pulse_length = int(0.07 * sr)
+        pulse_time = np.arange(pulse_length, dtype=np.float32) / sr
+        pulse = (
+            np.sin(2 * np.pi * 62.0 * pulse_time)
+            * np.hanning(pulse_length).astype(np.float32)
+        )
+        for beat in beats:
+            for offset, scale in ((0.0, 0.45), (0.22, 0.28)):
+                start = int((beat + offset) * sr)
+                clean[start : start + pulse_length] += scale * pulse
+        contaminated = clean.copy()
+        contaminated_index = 5
+        start = int((beats[contaminated_index] - 0.09) * sr)
+        end = int((beats[contaminated_index] + 0.30) * sr)
+        contaminated[start:end] *= -3.0
+
+        focal = measure_focal_cycle_contamination(
+            contaminated,
+            sr,
+            beats,
+            ProcessingParams(),
+        )
+
+        self.assertTrue(focal["applied"])
+        self.assertGreaterEqual(focal["severe_cycle_count"], 1)
+        self.assertIn(
+            contaminated_index,
+            [item["beat_index"] for item in focal["severe_cycles"]],
+        )
 
     def test_rhythm_check_rejects_a_destroyed_postprocess_signal(self) -> None:
         sr = 8000
@@ -210,12 +248,75 @@ class HeartbeatDenoisingTest(unittest.TestCase):
                 "outlier_fraction": 0.0,
                 "cycles_used": 0,
             },
+            ProcessingParams(),
         )
 
         self.assertTrue(quality["needs_rerecording"])
         self.assertEqual(quality["denoising_status"], "rerecord")
         self.assertTrue(
             any("count or timing" in reason.lower() for reason in quality["rerecord_reasons"])
+        )
+
+    def test_low_cycle_confidence_is_limited_without_inventing_a_rerecord_failure(self) -> None:
+        sr = 8000
+        seconds = 12
+        beats = np.asarray(
+            [0.7, 1.2, 2.2, 2.7, 3.7, 4.2, 5.2, 5.7, 6.7, 7.2, 8.2, 8.7, 9.7, 10.2, 11.2],
+            dtype=np.float64,
+        )
+        raw = heartbeat_signal(sr, seconds, beats)
+        quality = assess_recording_quality(
+            raw,
+            raw,
+            np.abs(raw),
+            beats,
+            sr,
+            {
+                "estimated_bpm": 75.0,
+                "consensus_window_count": 3,
+                "window_count": 3,
+            },
+            [],
+            {
+                "is_clipping_suspected": False,
+                "interbeat_noise_reduction_db": -10.0,
+                "heartbeat_preservation_correlation": 1.0,
+                "rhythm_preservation": {
+                    "applied": True,
+                    "is_preserved": True,
+                    "matched_fraction": 1.0,
+                    "count_delta": 0,
+                    "median_timing_error_ms": 0.0,
+                    "median_ibi_error_fraction": 0.0,
+                },
+                "focal_cycle_contamination": {
+                    "applied": True,
+                    "severe_cycle_count": 0,
+                    "severe_cycle_fraction": 0.0,
+                },
+            },
+            {
+                "enabled": True,
+                "candidate_count": len(beats),
+                "confirmation_fraction": 1.0,
+                "median_correlation": 0.2,
+            },
+            {
+                "enabled": True,
+                "applied": True,
+                "median_cycle_correlation": 0.9,
+                "outlier_fraction": 0.0,
+                "cycles_used": len(beats),
+            },
+            ProcessingParams(),
+        )
+
+        self.assertFalse(quality["needs_rerecording"])
+        self.assertEqual(quality["denoising_status"], "limited")
+        self.assertLess(quality["score"], 75.0)
+        self.assertGreater(
+            quality["metrics"]["ibi_coefficient_of_variation"],
+            ProcessingParams().quality_high_ibi_cv,
         )
 
     def test_irrecoverable_clipping_requests_rerecording(self) -> None:

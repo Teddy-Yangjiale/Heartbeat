@@ -66,6 +66,7 @@ def render_result(result: dict) -> None:
     recording = summary["recording_quality"]
     cycle = result["cycle_consistency"]
     rhythm = result["rhythm_preservation"]
+    focal = result["focal_cycle_contamination"]
 
     metrics = st.columns(7)
     metrics[0].metric("Duration", f"{summary['duration_seconds']:.2f}s")
@@ -100,6 +101,12 @@ def render_result(result: dict) -> None:
         f"{rhythm['expected_beat_count']} beats matched; count delta {rhythm['count_delta']}; "
         f"median timing error {format_metric(rhythm['median_timing_error_ms'], ' ms')}."
     )
+    if focal["applied"]:
+        st.caption(
+            f"Focal contamination check: {focal['severe_cycle_count']} severe cycle(s); "
+            f"maximum RMS ratio {format_metric(focal['max_rms_ratio'])}; "
+            f"maximum peak ratio {format_metric(focal['max_peak_ratio'])}."
+        )
 
     if cycle["applied"]:
         st.caption(

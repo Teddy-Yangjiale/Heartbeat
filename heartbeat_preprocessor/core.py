@@ -72,6 +72,12 @@ class ProcessingParams:
     rhythm_maximum_count_delta_fraction: float = 0.20
     rhythm_maximum_median_timing_error_ms: float = 80.0
     rhythm_maximum_median_ibi_error_fraction: float = 0.12
+    focal_cycle_min_count: int = 6
+    focal_cycle_rms_ratio_threshold: float = 2.10
+    focal_cycle_peak_ratio_threshold: float = 1.90
+    focal_cycle_correlation_threshold: float = -0.10
+    quality_low_template_correlation: float = 0.35
+    quality_high_ibi_cv: float = 0.18
 
 
 def safe_stem(name: str) -> str:
@@ -136,6 +142,12 @@ def process_audio_bytes(
         bpm_info["period_seconds"],
         params,
     )
+    focal_cycle_contamination = measure_focal_cycle_contamination(
+        spectral_filtered,
+        sr,
+        beat_times,
+        params,
+    )
 
     cleanest_segment, segment_candidates = rank_cleanest_heartbeat_segments(
         beat_times,
@@ -169,6 +181,7 @@ def process_audio_bytes(
         beat_times,
         cycle_consistency,
         rhythm_preservation,
+        focal_cycle_contamination,
     )
     recording_quality = assess_recording_quality(
         mono,
@@ -181,6 +194,7 @@ def process_audio_bytes(
         quality,
         template_info,
         cycle_consistency,
+        params,
     )
     tempo_summary = build_summary(
         filename=filename,
@@ -237,6 +251,9 @@ def process_audio_bytes(
         "recording_quality.json": json.dumps(recording_quality, indent=2).encode("utf-8"),
         "cycle_consistency.json": json.dumps(cycle_consistency, indent=2).encode("utf-8"),
         "rhythm_preservation.json": json.dumps(rhythm_preservation, indent=2).encode("utf-8"),
+        "focal_cycle_contamination.json": json.dumps(
+            focal_cycle_contamination, indent=2
+        ).encode("utf-8"),
         "postprocess_beat_times.csv": make_beats_frame(
             np.asarray(rhythm_preservation["processed_beat_times_seconds"], dtype=np.float32)
         ).to_csv(index=False).encode("utf-8"),
@@ -270,6 +287,7 @@ def process_audio_bytes(
         "recording_quality": recording_quality,
         "cycle_consistency": cycle_consistency,
         "rhythm_preservation": rhythm_preservation,
+        "focal_cycle_contamination": focal_cycle_contamination,
         "cleanest_segment": cleanest_segment,
         "cleanest_audio": cleanest_audio,
         "playback_audio": playback_audio,
@@ -284,6 +302,7 @@ def make_markdown_report(summary: dict[str, Any]) -> str:
     quality = summary["quality"]
     recording_quality = summary["recording_quality"]
     rhythm = quality["rhythm_preservation"]
+    focal = quality["focal_cycle_contamination"]
     lines = [
         f"# Heartbeat Diagnostic Report: {summary['filename']}",
         "",
@@ -308,6 +327,9 @@ def make_markdown_report(summary: dict[str, Any]) -> str:
         f"- Post-process beat count delta: {rhythm['count_delta']}",
         f"- Post-process median timing error: {rhythm['median_timing_error_ms']} ms",
         f"- Post-process median IBI error fraction: {rhythm['median_ibi_error_fraction']}",
+        f"- Severe focal contaminated cycles: {focal['severe_cycle_count']}",
+        f"- Maximum cycle RMS ratio to median: {focal['max_rms_ratio']}",
+        f"- Maximum cycle peak ratio to median: {focal['max_peak_ratio']}",
         f"- Recording quality: {recording_quality['grade']} ({recording_quality['score']:.1f}/100)",
         f"- Needs re-recording: {recording_quality['needs_rerecording']}",
         "",
@@ -1059,6 +1081,122 @@ def rhythm_preservation_thresholds(params: ProcessingParams) -> dict[str, float]
     }
 
 
+def measure_focal_cycle_contamination(
+    signal_data: np.ndarray,
+    sr: int,
+    beat_times: np.ndarray,
+    params: ProcessingParams,
+) -> dict[str, Any]:
+    """Find isolated, high-energy cycles that disagree with the robust heartbeat template."""
+    beats = np.asarray(beat_times, dtype=np.float64)
+    pre = max(1, int(round(params.template_pre_ms * sr / 1000.0)))
+    post = max(1, int(round(params.template_post_ms * sr / 1000.0)))
+    rows: list[dict[str, Any]] = []
+    segments: list[np.ndarray] = []
+    for beat_index, time_seconds in enumerate(beats):
+        center = int(round(float(time_seconds) * sr))
+        start = center - pre
+        end = center + post
+        if start < 0 or end > len(signal_data):
+            continue
+        segment = signal_data[start:end].astype(np.float64)
+        segment -= float(np.mean(segment))
+        rms = float(np.sqrt(np.mean(np.square(segment))))
+        peak = float(np.max(np.abs(segment)))
+        norm = float(np.linalg.norm(segment))
+        if norm <= 1e-12:
+            continue
+        rows.append(
+            {
+                "beat_index": int(beat_index),
+                "time_seconds": float(time_seconds),
+                "rms": rms,
+                "peak": peak,
+            }
+        )
+        segments.append((segment / norm).astype(np.float64))
+
+    thresholds = {
+        "minimum_cycle_count": int(params.focal_cycle_min_count),
+        "minimum_rms_ratio": float(params.focal_cycle_rms_ratio_threshold),
+        "minimum_peak_ratio": float(params.focal_cycle_peak_ratio_threshold),
+        "maximum_template_correlation": float(
+            params.focal_cycle_correlation_threshold
+        ),
+    }
+    if len(segments) < params.focal_cycle_min_count:
+        return {
+            "applied": False,
+            "reason": "insufficient_complete_cycles",
+            "cycle_count": int(len(segments)),
+            "severe_cycle_count": 0,
+            "severe_cycle_fraction": 0.0,
+            "severe_cycles": [],
+            "max_rms_ratio": None,
+            "max_peak_ratio": None,
+            "minimum_template_correlation": None,
+            "thresholds": thresholds,
+            "cycles": rows,
+        }
+
+    stack = np.stack(segments)
+    template = np.median(stack, axis=0)
+    template -= float(np.mean(template))
+    template_norm = float(np.linalg.norm(template))
+    if template_norm <= 1e-12:
+        return {
+            "applied": False,
+            "reason": "degenerate_template",
+            "cycle_count": int(len(segments)),
+            "severe_cycle_count": 0,
+            "severe_cycle_fraction": 0.0,
+            "severe_cycles": [],
+            "max_rms_ratio": None,
+            "max_peak_ratio": None,
+            "minimum_template_correlation": None,
+            "thresholds": thresholds,
+            "cycles": rows,
+        }
+    template /= template_norm
+    median_rms = max(float(np.median([row["rms"] for row in rows])), 1e-12)
+    median_peak = max(float(np.median([row["peak"] for row in rows])), 1e-12)
+    severe_cycles = []
+    for row, segment in zip(rows, segments):
+        row["rms_ratio_to_median"] = float(row["rms"] / median_rms)
+        row["peak_ratio_to_median"] = float(row["peak"] / median_peak)
+        row["template_correlation"] = float(np.dot(segment, template))
+        row["is_severe_focal_contamination"] = bool(
+            row["rms_ratio_to_median"] >= params.focal_cycle_rms_ratio_threshold
+            and row["peak_ratio_to_median"] >= params.focal_cycle_peak_ratio_threshold
+            and row["template_correlation"] <= params.focal_cycle_correlation_threshold
+        )
+        if row["is_severe_focal_contamination"]:
+            severe_cycles.append(
+                {
+                    "beat_index": row["beat_index"],
+                    "time_seconds": row["time_seconds"],
+                    "rms_ratio_to_median": row["rms_ratio_to_median"],
+                    "peak_ratio_to_median": row["peak_ratio_to_median"],
+                    "template_correlation": row["template_correlation"],
+                }
+            )
+    return {
+        "applied": True,
+        "reason": "robust_template_energy_outlier_check",
+        "cycle_count": int(len(rows)),
+        "severe_cycle_count": int(len(severe_cycles)),
+        "severe_cycle_fraction": float(len(severe_cycles) / len(rows)),
+        "severe_cycles": severe_cycles,
+        "max_rms_ratio": float(max(row["rms_ratio_to_median"] for row in rows)),
+        "max_peak_ratio": float(max(row["peak_ratio_to_median"] for row in rows)),
+        "minimum_template_correlation": float(
+            min(row["template_correlation"] for row in rows)
+        ),
+        "thresholds": thresholds,
+        "cycles": rows,
+    }
+
+
 def normalize_manual_beat_times(
     manual_beat_times: np.ndarray | list[float] | None, duration: float
 ) -> np.ndarray | None:
@@ -1322,6 +1460,7 @@ def compute_quality(
     beat_times: np.ndarray,
     cycle_consistency: dict[str, Any],
     rhythm_preservation: dict[str, Any],
+    focal_cycle_contamination: dict[str, Any],
 ) -> dict[str, Any]:
     rms = float(np.sqrt(np.mean(cleaned * cleaned))) if len(cleaned) else 0.0
     peak = float(np.max(np.abs(cleaned))) if len(cleaned) else 0.0
@@ -1353,6 +1492,7 @@ def compute_quality(
         "cycle_outlier_fraction": float(cycle_consistency.get("outlier_fraction", 0.0)),
         "cycle_outlier_mean_gain_db": float(cycle_consistency.get("mean_gain_db_on_outliers", 0.0)),
         "rhythm_preservation": rhythm_preservation,
+        "focal_cycle_contamination": focal_cycle_contamination,
         "reconstruction_policy": "attenuation_only_no_template_replacement",
     }
 
@@ -1469,6 +1609,7 @@ def assess_recording_quality(
     base_quality: dict[str, Any],
     template_info: dict[str, Any],
     cycle_consistency: dict[str, Any],
+    params: ProcessingParams,
 ) -> dict[str, Any]:
     """Produce a conservative recording-usability score, not a medical diagnosis."""
     reasons: list[str] = []
@@ -1515,6 +1656,27 @@ def assess_recording_quality(
         if template_info["confirmation_fraction"] < 0.6:
             score -= 12.0
             reasons.append("Many candidate beats do not match the learned heartbeat template.")
+        template_median = template_info.get("median_correlation")
+        if (
+            template_median is not None
+            and float(template_median) < params.quality_low_template_correlation
+        ):
+            score -= 15.0
+            reasons.append(
+                "The median heartbeat-template correlation is low; recurrent noise or uncertain cycle alignment may remain."
+            )
+
+    ibi = np.diff(np.asarray(beat_times, dtype=np.float64))
+    ibi_cv = (
+        float(np.std(ibi) / np.mean(ibi))
+        if len(ibi) >= 2 and float(np.mean(ibi)) > 1e-6
+        else None
+    )
+    if ibi_cv is not None and ibi_cv > params.quality_high_ibi_cv:
+        score -= 12.0
+        reasons.append(
+            "Detected heartbeat intervals vary strongly; automatic cycle alignment is less reliable."
+        )
 
     cycle_correlation = cycle_consistency.get("median_cycle_correlation")
     cycle_outlier_fraction = float(cycle_consistency.get("outlier_fraction", 0.0))
@@ -1542,6 +1704,22 @@ def assess_recording_quality(
         reasons.append("Independent post-denoising detection did not preserve enough heartbeat timing events.")
         rerecord_reasons.append(
             "Heartbeat count or timing could not be verified after denoising; exporting it as reliable would be unsafe."
+        )
+
+    focal = base_quality.get("focal_cycle_contamination", {})
+    if focal.get("applied") and int(focal.get("severe_cycle_count", 0)) > 0:
+        score -= 25.0
+        severe_times = ", ".join(
+            f"{float(item['time_seconds']):.2f}s"
+            for item in focal.get("severe_cycles", [])
+        )
+        reasons.append(
+            "One or more isolated high-energy heartbeat windows disagree with the robust cycle template."
+        )
+        rerecord_reasons.append(
+            "Severe focal contamination overlaps a heartbeat window"
+            + (f" near {severe_times}" if severe_times else "")
+            + "; it cannot be removed safely without risking a false or damaged heart sound."
         )
 
     score = float(np.clip(score, 0.0, 100.0))
@@ -1577,6 +1755,8 @@ def assess_recording_quality(
             "window_count": window_count,
             "consensus_window_count": consensus_windows,
             "template_confirmation_fraction": template_info["confirmation_fraction"],
+            "template_median_correlation": template_info.get("median_correlation"),
+            "ibi_coefficient_of_variation": ibi_cv,
             "cycle_consistency_applied": bool(cycle_consistency.get("applied", False)),
             "cycle_count": int(cycle_consistency.get("cycles_used", 0)),
             "median_cycle_correlation": cycle_correlation,
@@ -1591,6 +1771,15 @@ def assess_recording_quality(
             ),
             "rhythm_preservation_median_ibi_error_fraction": rhythm.get(
                 "median_ibi_error_fraction"
+            ),
+            "focal_contamination_severe_cycle_count": focal.get("severe_cycle_count"),
+            "focal_contamination_severe_cycle_fraction": focal.get(
+                "severe_cycle_fraction"
+            ),
+            "focal_contamination_max_rms_ratio": focal.get("max_rms_ratio"),
+            "focal_contamination_max_peak_ratio": focal.get("max_peak_ratio"),
+            "focal_contamination_minimum_template_correlation": focal.get(
+                "minimum_template_correlation"
             ),
         },
     }
