@@ -5,7 +5,6 @@ import json
 import math
 import os
 import re
-import tempfile
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -28,36 +27,51 @@ DEFAULT_EXPORT_PEAK_DBFS = 20.0 * math.log10(0.8)
 
 @dataclass(frozen=True)
 class ProcessingParams:
-    bandpass_low_hz: float = 25.0
-    bandpass_high_hz: float = 160.0
+    bandpass_low_hz: float = 20.0
+    bandpass_high_hz: float = 250.0
     envelope_lowpass_hz: float = 6.0
     min_bpm: float = 40.0
     max_bpm: float = 140.0
     peak_prominence: float = 0.12
     peak_height_percentile: float = 65.0
     double_peak_suppression: float = 0.65
-    target_loop_beats: int = 4
-    crossfade_ms: float = 12.0
-    zero_crossing_search_ms: float = 20.0
     export_envelope_hz: float = 100.0
     export_peak_dbfs: float = DEFAULT_EXPORT_PEAK_DBFS
-    enable_speech_suppression: bool = True
-    hpss_margin: float = 2.0
+    enable_denoising: bool = True
     spectral_noise_percentile: float = 15.0
     spectral_reduction_strength: float = 1.15
     spectral_floor_db: float = -30.0
     beat_gate_pre_ms: float = 90.0
     beat_gate_post_ms: float = 300.0
     between_beat_attenuation_db: float = -28.0
+    enable_cycle_consistency: bool = True
+    cycle_min_count: int = 6
+    cycle_phase_bins: int = 160
+    cycle_outlier_z: float = 3.5
+    cycle_outlier_attenuation_db: float = -18.0
+    cycle_core_protection_fraction: float = 0.35
+    cycle_core_protection_ms: float = 45.0
+    cycle_core_gate_guard_ms: float = 20.0
     analysis_window_seconds: float = 6.0
     analysis_window_hop_seconds: float = 3.0
     min_consensus_windows: int = 2
-    loop_candidate_count: int = 5
     enable_template_confirmation: bool = True
     template_pre_ms: float = 90.0
     template_post_ms: float = 300.0
     template_correlation_threshold: float = 0.35
     min_template_beats: int = 4
+    cleanest_segment_beats: int = 4
+    cleanest_candidate_count: int = 5
+    segment_zero_crossing_search_ms: float = 20.0
+    segment_edge_fade_ms: float = 12.0
+    playback_loop_target_rms_dbfs: float = -17.5
+    playback_loop_peak_dbfs: float = -1.0
+    playback_loop_max_softclip_drive: float = 8.0
+    rhythm_match_tolerance_ms: float = 120.0
+    rhythm_minimum_match_fraction: float = 0.85
+    rhythm_maximum_count_delta_fraction: float = 0.20
+    rhythm_maximum_median_timing_error_ms: float = 80.0
+    rhythm_maximum_median_ibi_error_fraction: float = 0.12
 
 
 def safe_stem(name: str) -> str:
@@ -80,7 +94,6 @@ def process_audio_bytes(
     data: bytes,
     params: ProcessingParams | None = None,
     manual_beat_times: np.ndarray | list[float] | None = None,
-    manual_loop_range: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     params = params or ProcessingParams()
     sr, raw, source_info = read_audio_bytes(filename, data)
@@ -95,12 +108,12 @@ def process_audio_bytes(
         cleaned_for_analysis = dc_removed.copy()
 
     band_limited = bandpass(cleaned_for_analysis, sr, params.bandpass_low_hz, params.bandpass_high_hz)
-    filtered = suppress_non_heart_content(band_limited, sr, params)
-    envelope = extract_envelope(filtered, sr, params.envelope_lowpass_hz)
+    spectral_filtered = suppress_non_heart_content(band_limited, sr, params)
+    envelope = extract_envelope(spectral_filtered, sr, params.envelope_lowpass_hz)
     bpm_info, window_analysis = estimate_bpm_with_consensus(envelope, sr, params)
     candidate_beat_times = detect_beats(envelope, sr, bpm_info["period_seconds"], params)
     beat_times, template_info, template_analysis, template_waveform = confirm_beats_with_template(
-        filtered, candidate_beat_times, sr, bpm_info["period_seconds"], params
+        spectral_filtered, candidate_beat_times, sr, bpm_info["period_seconds"], params
     )
     normalized_manual_beats = normalize_manual_beat_times(manual_beat_times, duration)
     if normalized_manual_beats is not None:
@@ -114,38 +127,60 @@ def process_audio_bytes(
             "method": "manual_beat_times",
         }
     ibi = np.diff(beat_times)
-    manual_loop = normalize_manual_loop_range(manual_loop_range, duration)
-    if manual_loop is not None:
-        loop_info = make_manual_loop_info(beat_times, manual_loop)
-        loop_candidates = [{**loop_info, "rank": 1}]
-    else:
-        loop_info, loop_candidates = rank_loop_candidates(
-            beat_times,
-            envelope,
-            sr,
-            duration,
-            params.target_loop_beats,
-            bpm_info["period_seconds"],
-            params.loop_candidate_count,
-        )
-    manual_corrections = {
-        "beat_times_overridden": normalized_manual_beats is not None,
-        "loop_range_overridden": manual_loop is not None,
-        "manual_beat_count": int(len(normalized_manual_beats)) if normalized_manual_beats is not None else None,
-        "manual_loop_range_seconds": list(manual_loop) if manual_loop is not None else None,
-    }
-    cleaned = apply_beat_synchronous_gate(filtered, sr, beat_times, params)
-    loop_audio, loop_audio_info = cut_loop(cleaned, sr, loop_info, params)
+    filtered, cycle_consistency = cycle_consistency_denoise(spectral_filtered, sr, beat_times, params)
+    cleaned = apply_beat_synchronous_gate(filtered, sr, beat_times, params, cycle_consistency)
+    rhythm_preservation = measure_rhythm_preservation(
+        cleaned,
+        sr,
+        beat_times,
+        bpm_info["period_seconds"],
+        params,
+    )
+
+    cleanest_segment, segment_candidates = rank_cleanest_heartbeat_segments(
+        beat_times,
+        envelope,
+        cleaned,
+        sr,
+        duration,
+        params,
+        cycle_consistency,
+    )
+    cleanest_audio, segment_boundary = cut_cleanest_heartbeat_segment(cleaned, sr, cleanest_segment, params)
+    cleanest_segment = {**cleanest_segment, **segment_boundary}
+    playback_audio, playback_loudness = optimize_loop_playback_loudness(cleanest_audio, params)
+    cleanest_segment["playback_loudness"] = playback_loudness
 
     # Use one headroom-preserving target for every exported WAV.
     export_target_peak = peak_from_dbfs(params.export_peak_dbfs)
-    filtered_audio = normalize_for_wav(cleaned, target_peak=export_target_peak)
+    input_reference_audio = normalize_for_wav(mono, target_peak=export_target_peak)
+    spectral_filtered_audio = normalize_for_wav(spectral_filtered, target_peak=export_target_peak)
+    filtered_audio = normalize_for_wav(filtered, target_peak=export_target_peak)
     cleaned_audio = normalize_for_wav(cleaned, target_peak=export_target_peak)
-    loop_audio = normalize_for_wav(loop_audio, target_peak=export_target_peak)
+    cleanest_audio = normalize_for_wav(cleanest_audio, target_peak=export_target_peak)
 
-    quality = compute_quality(mono, cleaned, sr, source_info, params, beat_times)
+    quality = compute_quality(
+        mono,
+        spectral_filtered,
+        cleaned,
+        sr,
+        source_info,
+        params,
+        beat_times,
+        cycle_consistency,
+        rhythm_preservation,
+    )
     recording_quality = assess_recording_quality(
-        mono, filtered, envelope, beat_times, sr, bpm_info, window_analysis, quality, template_info
+        mono,
+        filtered,
+        envelope,
+        beat_times,
+        sr,
+        bpm_info,
+        window_analysis,
+        quality,
+        template_info,
+        cycle_consistency,
     )
     tempo_summary = build_summary(
         filename=filename,
@@ -157,19 +192,18 @@ def process_audio_bytes(
         bpm_info=bpm_info,
         beat_times=beat_times,
         ibi=ibi,
-        loop_info={**loop_info, **loop_audio_info},
         template_info=template_info,
-        manual_corrections=manual_corrections,
         params=params,
     )
+    tempo_summary["cleanest_segment"] = cleanest_segment
 
     stem = safe_stem(filename)
     envelope_df = make_envelope_frame(envelope, sr, params.export_envelope_hz)
     beats_df = make_beats_frame(beat_times)
     ibi_df = make_ibi_frame(beat_times)
     window_analysis_df = pd.DataFrame(window_analysis)
-    loop_candidates_df = pd.DataFrame(loop_candidates)
     template_analysis_df = pd.DataFrame(template_analysis)
+    segment_candidates_df = pd.DataFrame(segment_candidates)
     template_waveform_df = pd.DataFrame(
         {
             "relative_time_seconds": np.arange(len(template_waveform), dtype=np.float32) / sr
@@ -185,7 +219,6 @@ def process_audio_bytes(
         envelope=envelope,
         beat_times=beat_times,
         sr=sr,
-        loop_info=loop_info,
         ibi=ibi,
         bpm_info=bpm_info,
         template_analysis=template_analysis,
@@ -199,14 +232,22 @@ def process_audio_bytes(
         "ibi.csv": ibi_df.to_csv(index=False).encode("utf-8"),
         "envelope.csv": envelope_df.to_csv(index=False).encode("utf-8"),
         "window_analysis.csv": window_analysis_df.to_csv(index=False).encode("utf-8"),
-        "loop_candidates.csv": loop_candidates_df.to_csv(index=False).encode("utf-8"),
         "template_analysis.csv": template_analysis_df.to_csv(index=False).encode("utf-8"),
         "heartbeat_template.csv": template_waveform_df.to_csv(index=False).encode("utf-8"),
-        "manual_corrections.json": json.dumps(manual_corrections, indent=2).encode("utf-8"),
         "recording_quality.json": json.dumps(recording_quality, indent=2).encode("utf-8"),
+        "cycle_consistency.json": json.dumps(cycle_consistency, indent=2).encode("utf-8"),
+        "rhythm_preservation.json": json.dumps(rhythm_preservation, indent=2).encode("utf-8"),
+        "postprocess_beat_times.csv": make_beats_frame(
+            np.asarray(rhythm_preservation["processed_beat_times_seconds"], dtype=np.float32)
+        ).to_csv(index=False).encode("utf-8"),
+        "cleanest_segment.json": json.dumps(cleanest_segment, indent=2).encode("utf-8"),
+        "cleanest_segment_candidates.csv": segment_candidates_df.to_csv(index=False).encode("utf-8"),
+        "input_reference.wav": wav_bytes(sr, input_reference_audio),
+        "spectral_filtered.wav": wav_bytes(sr, spectral_filtered_audio),
         "cleaned.wav": wav_bytes(sr, cleaned_audio),
         "filtered_detection.wav": wav_bytes(sr, filtered_audio),
-        "best_loop.wav": wav_bytes(sr, loop_audio),
+        "cleanest_heartbeat_loop.wav": wav_bytes(sr, cleanest_audio),
+        "cleanest_heartbeat_loop_loud.wav": wav_bytes(sr, playback_audio),
         "diagnostic_plot.png": diagnostic_png,
     }
 
@@ -217,17 +258,22 @@ def process_audio_bytes(
         "sample_rate": sr,
         "params": params,
         "raw": mono,
+        "spectral_filtered": spectral_filtered_audio,
         "cleaned": cleaned_audio,
         "filtered": filtered_audio,
         "envelope": envelope,
         "beat_times": beat_times,
         "ibi": ibi,
         "window_analysis": window_analysis,
-        "loop_candidates": loop_candidates,
         "template_analysis": template_analysis,
-        "loop_audio": loop_audio,
         "summary": tempo_summary,
         "recording_quality": recording_quality,
+        "cycle_consistency": cycle_consistency,
+        "rhythm_preservation": rhythm_preservation,
+        "cleanest_segment": cleanest_segment,
+        "cleanest_audio": cleanest_audio,
+        "playback_audio": playback_audio,
+        "segment_candidates": segment_candidates,
         "artifacts": artifacts,
         "zip_bytes": make_zip_bytes(stem, artifacts),
     }
@@ -235,9 +281,9 @@ def process_audio_bytes(
 
 def make_markdown_report(summary: dict[str, Any]) -> str:
     tempo = summary["tempo"]
-    loop = summary["best_loop"]
     quality = summary["quality"]
     recording_quality = summary["recording_quality"]
+    rhythm = quality["rhythm_preservation"]
     lines = [
         f"# Heartbeat Diagnostic Report: {summary['filename']}",
         "",
@@ -253,9 +299,17 @@ def make_markdown_report(summary: dict[str, Any]) -> str:
         f"- DC offset: {quality['dc_offset']:.8f}",
         f"- Clipping fraction: {quality['clipping_fraction']:.8f}",
         f"- Clipping suspected: {quality['is_clipping_suspected']}",
-        f"- Speech/noise suppression enabled: {quality['speech_suppression_enabled']}",
+        f"- Heartbeat denoising enabled: {quality['denoising_enabled']}",
         f"- Beat-window coverage: {quality['beat_window_coverage_fraction']:.3f}",
+        f"- Inter-beat noise reduction: {quality['interbeat_noise_reduction_db']} dB",
+        f"- Heartbeat preservation correlation: {quality['heartbeat_preservation_correlation']}",
+        f"- Post-process rhythm preserved: {rhythm['is_preserved']}",
+        f"- Post-process beat match: {rhythm['matched_beat_count']}/{rhythm['expected_beat_count']} ({rhythm['matched_fraction']:.3f})",
+        f"- Post-process beat count delta: {rhythm['count_delta']}",
+        f"- Post-process median timing error: {rhythm['median_timing_error_ms']} ms",
+        f"- Post-process median IBI error fraction: {rhythm['median_ibi_error_fraction']}",
         f"- Recording quality: {recording_quality['grade']} ({recording_quality['score']:.1f}/100)",
+        f"- Needs re-recording: {recording_quality['needs_rerecording']}",
         "",
         "## Tempo And Beats",
         f"- Autocorrelation BPM: {tempo['estimated_bpm']:.3f}",
@@ -268,18 +322,6 @@ def make_markdown_report(summary: dict[str, Any]) -> str:
         f"- Median-IBI BPM: {tempo['picked_bpm_from_median_ibi']}",
         f"- IBI mean: {tempo['ibi_mean_seconds']}",
         f"- IBI std: {tempo['ibi_std_seconds']}",
-        "",
-        "## Selected Loop",
-        f"- Method: {loop['method']}",
-        f"- Start: {loop['start_seconds']:.6f} s",
-        f"- End: {loop['end_seconds']:.6f} s",
-        f"- Duration: {loop['duration_seconds']:.6f} s",
-        f"- Beats: {loop['num_beats']}",
-        f"- Local BPM: {loop['local_bpm']:.3f}",
-        f"- Regularity score: {loop['regularity_score']}",
-        f"- Loop quality score: {format_optional_score(loop['quality_score'])}",
-        f"- Manual beat correction: {summary['manual_corrections']['beat_times_overridden']}",
-        f"- Manual loop correction: {summary['manual_corrections']['loop_range_overridden']}",
         "",
         "## Processing Parameters",
     ]
@@ -301,9 +343,7 @@ def read_audio_bytes(filename: str, data: bytes) -> tuple[int, np.ndarray, dict[
         sr, raw, info = read_wav_bytes(data)
         info["format"] = "wav"
         return sr, raw, info
-    if suffix == ".mp3":
-        return read_compressed_audio_bytes(filename, data)
-    raise ValueError(f"Unsupported heartbeat audio type: {suffix or '<none>'}. Use .wav or .mp3.")
+    raise ValueError(f"Unsupported heartbeat audio type: {suffix or '<none>'}. Use a WAV file.")
 
 
 def read_wav_bytes(data: bytes) -> tuple[int, np.ndarray, dict[str, Any]]:
@@ -314,40 +354,6 @@ def read_wav_bytes(data: bytes) -> tuple[int, np.ndarray, dict[str, Any]]:
         "shape": list(raw.shape),
         "channels": int(raw.shape[1]) if raw.ndim == 2 else 1,
         "samples": int(raw.shape[0]),
-    }
-    return int(sr), raw, info
-
-
-def read_compressed_audio_bytes(filename: str, data: bytes) -> tuple[int, np.ndarray, dict[str, Any]]:
-    suffix = Path(filename).suffix.lower() or ".mp3"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
-    try:
-        y, sr = librosa.load(tmp_path, sr=None, mono=False)
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-
-    if y.ndim == 1:
-        raw = y.astype(np.float32)
-        channels = 1
-        samples = int(raw.shape[0])
-        shape = [samples]
-    else:
-        raw = y.T.astype(np.float32)
-        channels = int(raw.shape[1])
-        samples = int(raw.shape[0])
-        shape = list(raw.shape)
-    info = {
-        "sample_rate": int(sr),
-        "dtype": "float32",
-        "shape": shape,
-        "channels": channels,
-        "samples": samples,
-        "format": suffix.lstrip("."),
     }
     return int(sr), raw, info
 
@@ -389,23 +395,11 @@ def bandpass(x: np.ndarray, sr: int, low_hz: float, high_hz: float) -> np.ndarra
 
 
 def suppress_non_heart_content(x: np.ndarray, sr: int, params: ProcessingParams) -> np.ndarray:
-    """Favor short, low-frequency cardiac transients over sustained speech and room noise."""
-    if not len(x) or not params.enable_speech_suppression:
+    """Reduce the persistent noise floor without inventing replacement heart sounds."""
+    if not len(x) or not params.enable_denoising:
         return x.astype(np.float32, copy=True)
 
-    n_fft = min(2048, max(256, 2 ** int(np.floor(np.log2(max(256, sr * 0.08))))))
-    hop_length = max(64, n_fft // 4)
-    if len(x) < n_fft:
-        return spectral_noise_gate(x, sr, params)
-
-    spectrum = librosa.stft(x.astype(np.float32), n_fft=n_fft, hop_length=hop_length, center=True)
-    harmonic, percussive = librosa.decompose.hpss(
-        spectrum,
-        kernel_size=(31, 17),
-        margin=(max(1.0, params.hpss_margin), 1.0),
-    )
-    heart_like = librosa.istft(percussive, hop_length=hop_length, length=len(x))
-    return spectral_noise_gate(heart_like, sr, params)
+    return spectral_noise_gate(x, sr, params)
 
 
 def spectral_noise_gate(x: np.ndarray, sr: int, params: ProcessingParams) -> np.ndarray:
@@ -427,25 +421,188 @@ def spectral_noise_gate(x: np.ndarray, sr: int, params: ProcessingParams) -> np.
     return gated.astype(np.float32)
 
 
+def cycle_consistency_denoise(
+    x: np.ndarray,
+    sr: int,
+    beat_times: np.ndarray,
+    params: ProcessingParams,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Attenuate cycle-local envelope outliers while protecting recurrent S1/S2 energy.
+
+    The learned template is used only to derive an attenuation mask. It is never
+    copied into the output, so this stage cannot synthesize or repeat a heartbeat.
+    """
+    beats = np.asarray(beat_times, dtype=np.float64)
+    base_info: dict[str, Any] = {
+        "enabled": bool(params.enable_cycle_consistency),
+        "applied": False,
+        "method": "attenuation_only_cycle_envelope",
+        "reason": None,
+        "cycles_available": max(0, int(len(beats) - 1)),
+        "cycles_used": 0,
+        "median_period_seconds": None,
+        "median_cycle_correlation": None,
+        "outlier_fraction": 0.0,
+        "mean_gain_db_on_outliers": 0.0,
+        "core_protected_fraction": 0.0,
+        "core_phase_ranges": [],
+    }
+    if not len(x) or not params.enable_cycle_consistency:
+        base_info["reason"] = "disabled_or_empty"
+        return x.astype(np.float32, copy=True), base_info
+    if len(beats) < params.cycle_min_count + 1:
+        base_info["reason"] = "insufficient_complete_cycles"
+        return x.astype(np.float32, copy=True), base_info
+
+    periods = np.diff(beats)
+    finite_periods = periods[np.isfinite(periods) & (periods > 0.2)]
+    if not len(finite_periods):
+        base_info["reason"] = "invalid_cycle_periods"
+        return x.astype(np.float32, copy=True), base_info
+    median_period = float(np.median(finite_periods))
+    phase_bins = max(64, int(params.cycle_phase_bins))
+    phase_grid = np.linspace(0.0, 1.0, phase_bins, dtype=np.float64)
+    pre_seconds = max(0.0, params.beat_gate_pre_ms / 1000.0)
+
+    energy_window = max(3, int(round(0.018 * sr)))
+    kernel = np.ones(energy_window, dtype=np.float64) / energy_window
+    energy = np.sqrt(
+        np.maximum(signal.fftconvolve(np.square(x, dtype=np.float64), kernel, mode="same"), 0.0)
+    )
+
+    cycle_rows: list[dict[str, Any]] = []
+    normalized_envelopes: list[np.ndarray] = []
+    for index, period in enumerate(periods):
+        if not np.isfinite(period) or period < 0.70 * median_period or period > 1.30 * median_period:
+            continue
+        start = max(0, int(round((beats[index] - pre_seconds) * sr)))
+        end = min(len(x), int(round((beats[index + 1] - pre_seconds) * sr)))
+        if end - start < max(32, phase_bins // 2):
+            continue
+        source_phase = np.linspace(0.0, 1.0, end - start, dtype=np.float64)
+        warped = np.interp(phase_grid, source_phase, energy[start:end])
+        scale = float(np.percentile(warped, 90))
+        if scale <= 1e-9:
+            continue
+        normalized_envelopes.append((warped / scale).astype(np.float64))
+        cycle_rows.append({"index": index, "start": start, "end": end})
+
+    if len(normalized_envelopes) < params.cycle_min_count:
+        base_info["reason"] = "insufficient_regular_cycles"
+        base_info["cycles_used"] = len(normalized_envelopes)
+        return x.astype(np.float32, copy=True), base_info
+
+    stack = np.stack(normalized_envelopes)
+    template = np.median(stack, axis=0)
+    mad = np.median(np.abs(stack - template), axis=0)
+    robust_sigma = 1.4826 * mad + max(0.015, 0.03 * float(np.max(template)))
+
+    template_peak = float(np.max(template))
+    core = template >= max(1e-9, params.cycle_core_protection_fraction * template_peak)
+    protection_bins = max(
+        1,
+        int(round(params.cycle_core_protection_ms / 1000.0 / max(median_period, 1e-6) * phase_bins)),
+    )
+    if np.any(core) and protection_bins > 0:
+        core = np.convolve(core.astype(np.int16), np.ones(2 * protection_bins + 1), mode="same") > 0
+    core_phase_ranges: list[list[float]] = []
+    range_start: int | None = None
+    for index, is_core in enumerate(np.append(core, False)):
+        if is_core and range_start is None:
+            range_start = index
+        elif not is_core and range_start is not None:
+            denominator = max(1, phase_bins - 1)
+            core_phase_ranges.append(
+                [float(range_start / denominator), float(min(index, phase_bins - 1) / denominator)]
+            )
+            range_start = None
+
+    correlations: list[float] = []
+    template_centered = template - float(np.mean(template))
+    template_norm = float(np.linalg.norm(template_centered))
+    gain = np.ones(len(x), dtype=np.float64)
+    covered = np.zeros(len(x), dtype=bool)
+    outlier_samples = np.zeros(len(x), dtype=bool)
+    floor_gain = float(10.0 ** (params.cycle_outlier_attenuation_db / 20.0))
+
+    for row, normalized in zip(cycle_rows, normalized_envelopes):
+        centered = normalized - float(np.mean(normalized))
+        denom = float(np.linalg.norm(centered)) * template_norm
+        correlations.append(float(np.dot(centered, template_centered) / denom) if denom > 1e-9 else 0.0)
+
+        positive_z = np.maximum((normalized - template) / robust_sigma, 0.0)
+        severity = np.clip(
+            (positive_z - params.cycle_outlier_z) / max(params.cycle_outlier_z, 1e-6),
+            0.0,
+            1.0,
+        )
+        # Recurrent S1/S2 bins are protected; unusually large energy can still
+        # receive a very small attenuation instead of being deleted outright.
+        severity[core] *= 0.15
+        phase_gain = 1.0 - severity * (1.0 - floor_gain)
+
+        start = int(row["start"])
+        end = int(row["end"])
+        source_phase = np.linspace(0.0, 1.0, end - start, dtype=np.float64)
+        sample_gain = np.interp(source_phase, phase_grid, phase_gain)
+        gain[start:end] = np.minimum(gain[start:end], sample_gain)
+        covered[start:end] = True
+        outlier_samples[start:end] |= sample_gain < 0.98
+
+    smoothing = max(1, int(round(0.012 * sr)))
+    if smoothing > 1:
+        smooth_kernel = np.ones(smoothing, dtype=np.float64) / smoothing
+        smoothed = signal.fftconvolve(gain, smooth_kernel, mode="same")
+        edge = min(smoothing, len(smoothed) // 2)
+        if edge:
+            smoothed[:edge] = gain[:edge]
+            smoothed[-edge:] = gain[-edge:]
+        gain = np.clip(smoothed, floor_gain, 1.0)
+
+    covered_count = int(np.sum(covered))
+    outlier_count = int(np.sum(outlier_samples & covered))
+    outlier_gains = gain[outlier_samples & covered]
+    base_info.update(
+        {
+            "applied": True,
+            "reason": "ok",
+            "cycles_used": len(normalized_envelopes),
+            "median_period_seconds": median_period,
+            "median_cycle_correlation": float(np.median(correlations)) if correlations else None,
+            "outlier_fraction": float(outlier_count / covered_count) if covered_count else 0.0,
+            "mean_gain_db_on_outliers": float(20.0 * np.log10(np.mean(outlier_gains) + 1e-12))
+            if len(outlier_gains)
+            else 0.0,
+            "core_protected_fraction": float(np.mean(core)),
+            "core_phase_ranges": core_phase_ranges,
+        }
+    )
+    return (x * gain.astype(np.float32)).astype(np.float32), base_info
+
+
 def apply_beat_synchronous_gate(
-    x: np.ndarray, sr: int, beat_times: np.ndarray, params: ProcessingParams
+    x: np.ndarray,
+    sr: int,
+    beat_times: np.ndarray,
+    params: ProcessingParams,
+    cycle_consistency: dict[str, Any] | None = None,
 ) -> np.ndarray:
     """Keep the S1/S2 region of each beat and attenuate audio between cardiac events."""
-    if not len(x) or not params.enable_speech_suppression or not len(beat_times):
+    if not len(x) or not params.enable_denoising or not len(beat_times):
         return x.astype(np.float32, copy=True)
 
-    floor_gain = float(10.0 ** (params.between_beat_attenuation_db / 20.0))
+    effective_attenuation_db = effective_between_beat_attenuation_db(params, cycle_consistency)
+    floor_gain = float(10.0 ** (effective_attenuation_db / 20.0))
     mask = np.full(len(x), floor_gain, dtype=np.float32)
     pre = max(0, int(params.beat_gate_pre_ms * sr / 1000.0))
     post = max(1, int(params.beat_gate_post_ms * sr / 1000.0))
     ramp = max(1, min(int(0.025 * sr), (pre + post) // 5))
 
-    for time_seconds in beat_times:
-        center = int(round(float(time_seconds) * sr))
-        start = max(0, center - pre)
-        end = min(len(x), center + post)
+    def retain_window(start: int, end: int) -> None:
+        start = max(0, start)
+        end = min(len(x), end)
         if end <= start:
-            continue
+            return
         mask[start:end] = 1.0
         left_start = max(0, start - ramp)
         if start > left_start:
@@ -459,7 +616,54 @@ def apply_beat_synchronous_gate(
                 mask[end:right_end],
                 np.linspace(1.0, floor_gain, right_end - end, endpoint=False, dtype=np.float32),
             )
+
+    for time_seconds in beat_times:
+        center = int(round(float(time_seconds) * sr))
+        retain_window(center - pre, center + post)
+
+    cycle_consistency = cycle_consistency or {}
+    core_ranges = cycle_consistency.get("core_phase_ranges", [])
+    beats = np.asarray(beat_times, dtype=np.float64)
+    if cycle_consistency.get("applied") and core_ranges and len(beats) >= 2:
+        median_period = float(cycle_consistency.get("median_period_seconds") or np.median(np.diff(beats)))
+        # A very small guard absorbs phase-warping and sample-rounding error.
+        # The recurrent template has already received the full protection
+        # padding, so this must remain much smaller than
+        # cycle_core_protection_ms.
+        core_guard = max(1, int(round(params.cycle_core_gate_guard_ms * sr / 1000.0)))
+        pre_seconds = pre / sr
+        for index, period in enumerate(np.diff(beats)):
+            if period < 0.70 * median_period or period > 1.30 * median_period:
+                continue
+            cycle_start = beats[index] - pre_seconds
+            for phase_start, phase_end in core_ranges:
+                # core_phase_ranges were already expanded by
+                # cycle_core_protection_ms when the recurrent template was
+                # created. Padding them again here preserved large pieces of
+                # between-beat noise around S2.
+                start = int(round((cycle_start + float(phase_start) * period) * sr)) - core_guard
+                end = int(round((cycle_start + float(phase_end) * period) * sr)) + core_guard
+                retain_window(start, end)
     return (x * mask).astype(np.float32)
+
+
+def effective_between_beat_attenuation_db(
+    params: ProcessingParams,
+    cycle_consistency: dict[str, Any] | None,
+) -> float:
+    """Limit gate depth when the 15-second recording does not support reliable cardiac timing."""
+    requested = float(params.between_beat_attenuation_db)
+    info = cycle_consistency or {}
+    if not info.get("applied"):
+        return max(requested, -6.0)
+
+    correlation = float(info.get("median_cycle_correlation") or 0.0)
+    outlier_fraction = float(info.get("outlier_fraction") or 0.0)
+    if correlation < 0.65 or outlier_fraction > 0.05:
+        return max(requested, -6.0)
+    if correlation < 0.75 or outlier_fraction > 0.035:
+        return max(requested, -12.0)
+    return requested
 
 
 def extract_envelope(x: np.ndarray, sr: int, lowpass_hz: float) -> np.ndarray:
@@ -713,6 +917,148 @@ def _template_info(
     }
 
 
+def measure_rhythm_preservation(
+    cleaned: np.ndarray,
+    sr: int,
+    expected_beat_times: np.ndarray,
+    expected_period_seconds: float,
+    params: ProcessingParams,
+) -> dict[str, Any]:
+    """Re-detect beats after denoising and compare them with the input timing sequence."""
+    expected = np.asarray(expected_beat_times, dtype=np.float64)
+    period = max(float(expected_period_seconds), 1e-6)
+    tolerance_seconds = min(params.rhythm_match_tolerance_ms / 1000.0, 0.25 * period)
+    if not len(cleaned) or sr <= 0 or len(expected) < 2:
+        return {
+            "applied": False,
+            "is_preserved": False,
+            "reason": "insufficient_signal_or_reference_beats",
+            "expected_beat_count": int(len(expected)),
+            "processed_beat_count": 0,
+            "matched_beat_count": 0,
+            "matched_fraction": 0.0,
+            "count_delta": int(-len(expected)),
+            "absolute_count_delta_fraction": 1.0 if len(expected) else 0.0,
+            "match_tolerance_ms": float(tolerance_seconds * 1000.0),
+            "median_timing_error_ms": None,
+            "p95_timing_error_ms": None,
+            "median_ibi_error_fraction": None,
+            "processed_beat_times_seconds": [],
+            "matched_expected_times_seconds": [],
+            "matched_processed_times_seconds": [],
+            "thresholds": rhythm_preservation_thresholds(params),
+        }
+
+    processed_envelope = extract_envelope(cleaned, sr, params.envelope_lowpass_hz)
+    candidates = detect_beats(processed_envelope, sr, period, params)
+    processed, template_info, _, _ = confirm_beats_with_template(
+        cleaned,
+        candidates,
+        sr,
+        period,
+        params,
+    )
+    processed = np.asarray(processed, dtype=np.float64)
+    matched_expected, matched_processed = match_beat_sequences(
+        expected,
+        processed,
+        tolerance_seconds,
+    )
+    matched_count = len(matched_expected)
+    matched_fraction = float(matched_count / len(expected))
+    count_delta = int(len(processed) - len(expected))
+    count_delta_fraction = float(abs(count_delta) / len(expected))
+    timing_errors = np.abs(matched_processed - matched_expected)
+    median_timing_error_ms = (
+        float(np.median(timing_errors) * 1000.0) if len(timing_errors) else None
+    )
+    p95_timing_error_ms = (
+        float(np.percentile(timing_errors, 95) * 1000.0) if len(timing_errors) else None
+    )
+    if len(matched_expected) >= 2:
+        expected_ibi = np.diff(matched_expected)
+        processed_ibi = np.diff(matched_processed)
+        valid = expected_ibi > 1e-6
+        ibi_errors = np.abs(processed_ibi[valid] - expected_ibi[valid]) / expected_ibi[valid]
+        median_ibi_error_fraction = float(np.median(ibi_errors)) if len(ibi_errors) else None
+    else:
+        median_ibi_error_fraction = None
+
+    is_preserved = bool(
+        matched_fraction >= params.rhythm_minimum_match_fraction
+        and count_delta_fraction <= params.rhythm_maximum_count_delta_fraction
+        and median_timing_error_ms is not None
+        and median_timing_error_ms <= params.rhythm_maximum_median_timing_error_ms
+        and median_ibi_error_fraction is not None
+        and median_ibi_error_fraction <= params.rhythm_maximum_median_ibi_error_fraction
+    )
+    return {
+        "applied": True,
+        "is_preserved": is_preserved,
+        "reason": "independent_postprocess_redetection",
+        "expected_beat_count": int(len(expected)),
+        "processed_candidate_count": int(len(candidates)),
+        "processed_beat_count": int(len(processed)),
+        "processed_template_method": template_info["method"],
+        "matched_beat_count": int(matched_count),
+        "matched_fraction": matched_fraction,
+        "count_delta": count_delta,
+        "absolute_count_delta_fraction": count_delta_fraction,
+        "match_tolerance_ms": float(tolerance_seconds * 1000.0),
+        "median_timing_error_ms": median_timing_error_ms,
+        "p95_timing_error_ms": p95_timing_error_ms,
+        "median_ibi_error_fraction": median_ibi_error_fraction,
+        "processed_beat_times_seconds": [round(float(value), 6) for value in processed],
+        "matched_expected_times_seconds": [round(float(value), 6) for value in matched_expected],
+        "matched_processed_times_seconds": [round(float(value), 6) for value in matched_processed],
+        "thresholds": rhythm_preservation_thresholds(params),
+    }
+
+
+def match_beat_sequences(
+    expected: np.ndarray,
+    processed: np.ndarray,
+    tolerance_seconds: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Greedily create an ordered, one-to-one match between two beat sequences."""
+    reference = np.sort(np.asarray(expected, dtype=np.float64))
+    observed = np.sort(np.asarray(processed, dtype=np.float64))
+    expected_matches: list[float] = []
+    processed_matches: list[float] = []
+    expected_index = 0
+    processed_index = 0
+    while expected_index < len(reference) and processed_index < len(observed):
+        delta = observed[processed_index] - reference[expected_index]
+        if abs(delta) <= tolerance_seconds:
+            expected_matches.append(float(reference[expected_index]))
+            processed_matches.append(float(observed[processed_index]))
+            expected_index += 1
+            processed_index += 1
+        elif delta < -tolerance_seconds:
+            processed_index += 1
+        else:
+            expected_index += 1
+    return (
+        np.asarray(expected_matches, dtype=np.float64),
+        np.asarray(processed_matches, dtype=np.float64),
+    )
+
+
+def rhythm_preservation_thresholds(params: ProcessingParams) -> dict[str, float]:
+    return {
+        "minimum_match_fraction": float(params.rhythm_minimum_match_fraction),
+        "maximum_absolute_count_delta_fraction": float(
+            params.rhythm_maximum_count_delta_fraction
+        ),
+        "maximum_median_timing_error_ms": float(
+            params.rhythm_maximum_median_timing_error_ms
+        ),
+        "maximum_median_ibi_error_fraction": float(
+            params.rhythm_maximum_median_ibi_error_fraction
+        ),
+    }
+
+
 def normalize_manual_beat_times(
     manual_beat_times: np.ndarray | list[float] | None, duration: float
 ) -> np.ndarray | None:
@@ -726,116 +1072,118 @@ def normalize_manual_beat_times(
     return values.astype(np.float32)
 
 
-def normalize_manual_loop_range(
-    manual_loop_range: tuple[float, float] | None, duration: float
-) -> tuple[float, float] | None:
-    if manual_loop_range is None:
-        return None
-    start, end = (float(manual_loop_range[0]), float(manual_loop_range[1]))
-    start = float(np.clip(start, 0.0, duration))
-    end = float(np.clip(end, 0.0, duration))
-    if end - start < 0.1:
-        raise ValueError("Manual loop end must be at least 0.1 seconds after its start.")
-    return start, end
-
-
-def make_manual_loop_info(beat_times: np.ndarray, loop_range: tuple[float, float]) -> dict[str, Any]:
-    start, end = loop_range
-    in_loop = np.asarray(beat_times)[(np.asarray(beat_times) >= start) & (np.asarray(beat_times) <= end)]
-    intervals = np.diff(in_loop)
-    local_bpm = float(60.0 / np.median(intervals)) if len(intervals) else 0.0
-    return {
-        "start_seconds": start,
-        "end_seconds": end,
-        "duration_seconds": end - start,
-        "num_beats": int(len(in_loop)),
-        "local_bpm": local_bpm,
-        "ibi_std_seconds": float(np.std(intervals)) if len(intervals) else None,
-        "regularity_score": float(np.std(intervals) / (np.mean(intervals) + 1e-9)) if len(intervals) else None,
-        "envelope_snr_db": None,
-        "quality_score": None,
-        "method": "manual_loop_range",
-    }
-
-
-def choose_best_loop(
-    beat_times: np.ndarray, duration: float, target_loop_beats: int, fallback_period: float
-) -> dict[str, Any]:
-    best, _ = rank_loop_candidates(
-        beat_times,
-        np.array([], dtype=np.float32),
-        1,
-        duration,
-        target_loop_beats,
-        fallback_period,
-        1,
-    )
-    return best
-
-
-def rank_loop_candidates(
+def rank_cleanest_heartbeat_segments(
     beat_times: np.ndarray,
     envelope: np.ndarray,
+    cleaned: np.ndarray,
     sr: int,
     duration: float,
-    target_loop_beats: int,
-    fallback_period: float,
-    candidate_limit: int,
+    params: ProcessingParams,
+    cycle_consistency: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Rank real, consecutive heartbeat cycles without reconstructing their waveform."""
     beats = np.asarray(beat_times, dtype=np.float64)
-    n_intervals = max(1, int(target_loop_beats))
+    cycle_count = max(1, int(params.cleanest_segment_beats))
     candidates: list[dict[str, Any]] = []
-    if len(beats) >= n_intervals + 1:
-        for i in range(0, len(beats) - n_intervals):
-            local = np.diff(beats[i : i + n_intervals + 1])
-            if np.any(local <= 0):
+    heart_mask = cycle_aware_heartbeat_mask(len(cleaned), sr, beats, params, cycle_consistency)
+
+    if len(beats) >= cycle_count + 1:
+        for index in range(len(beats) - cycle_count):
+            local_beats = beats[index : index + cycle_count + 1]
+            local_periods = np.diff(local_beats)
+            if np.any(~np.isfinite(local_periods)) or np.any(local_periods <= 0):
                 continue
-            regularity = float(np.std(local) / (np.mean(local) + 1e-9))
-            start = float(beats[i])
-            end = float(beats[i + n_intervals])
-            snr_db = estimate_envelope_snr(envelope, sr, start, end, beats[i : i + n_intervals + 1])
-            regularity_component = float(np.exp(-7.0 * regularity))
-            snr_component = float(np.clip(snr_db / 40.0, 0.0, 1.0))
-            quality_score = float(100.0 * (0.75 * regularity_component + 0.25 * snr_component))
+            start_seconds = float(local_beats[0])
+            end_seconds = float(local_beats[-1])
+            start = max(0, int(round(start_seconds * sr)))
+            end = min(len(cleaned), int(round(end_seconds * sr)))
+            if end <= start:
+                continue
+
+            local_mask = heart_mask[start:end]
+            local_audio = cleaned[start:end]
+            heart_rms = masked_rms(local_audio, local_mask)
+            gap_rms = masked_rms(local_audio, ~local_mask)
+            contrast_db = float(20.0 * math.log10((heart_rms + 1e-12) / (gap_rms + 1e-12)))
+            gap_rms_dbfs = dbfs(gap_rms)
+            regularity = float(np.std(local_periods) / (np.mean(local_periods) + 1e-9))
+            envelope_snr_db = estimate_envelope_snr(
+                envelope,
+                sr,
+                start_seconds,
+                end_seconds,
+                local_beats,
+            )
             candidates.append(
                 {
-                    "start_seconds": start,
-                    "end_seconds": end,
-                    "duration_seconds": end - start,
-                    "num_beats": n_intervals,
-                    "local_bpm": float(60.0 / np.median(local)),
-                    "ibi_std_seconds": float(np.std(local)),
+                    "start_seconds": start_seconds,
+                    "end_seconds": end_seconds,
+                    "duration_seconds": end_seconds - start_seconds,
+                    "cycle_count": cycle_count,
+                    "local_bpm": float(60.0 / np.median(local_periods)),
+                    "ibi_std_seconds": float(np.std(local_periods)),
                     "regularity_score": regularity,
-                    "envelope_snr_db": snr_db,
-                    "quality_score": quality_score,
-                    "method": "regularity_and_envelope_quality",
+                    "envelope_snr_db": envelope_snr_db,
+                    "heart_to_gap_contrast_db": contrast_db,
+                    "gap_rms_dbfs": gap_rms_dbfs,
+                    "method": "real_cycles_regularity_contrast_and_noise",
                 }
             )
-        if candidates:
-            candidates.sort(key=lambda item: item["quality_score"], reverse=True)
-            for rank, candidate in enumerate(candidates, start=1):
-                candidate["rank"] = rank
-            selected = dict(candidates[0])
-            selected.pop("rank", None)
-            return selected, candidates[: max(1, int(candidate_limit))]
 
+    if candidates:
+        gap_levels = np.asarray([item["gap_rms_dbfs"] for item in candidates], dtype=np.float64)
+        gap_best = float(np.min(gap_levels))
+        gap_worst = float(np.max(gap_levels))
+        for item in candidates:
+            regularity_component = float(np.exp(-7.0 * item["regularity_score"]))
+            contrast_component = float(np.clip(item["heart_to_gap_contrast_db"] / 30.0, 0.0, 1.0))
+            envelope_component = float(np.clip(item["envelope_snr_db"] / 40.0, 0.0, 1.0))
+            if gap_worst - gap_best > 1e-6:
+                quiet_component = float((gap_worst - item["gap_rms_dbfs"]) / (gap_worst - gap_best))
+            else:
+                quiet_component = 1.0
+            item["quality_score"] = float(
+                100.0
+                * (
+                    0.35 * regularity_component
+                    + 0.35 * contrast_component
+                    + 0.20 * envelope_component
+                    + 0.10 * quiet_component
+                )
+            )
+        candidates.sort(key=lambda item: item["quality_score"], reverse=True)
+        for rank, candidate in enumerate(candidates, start=1):
+            candidate["rank"] = rank
+        selected = dict(candidates[0])
+        selected.pop("rank", None)
+        selected["is_fallback"] = False
+        return selected, candidates[: max(1, int(params.cleanest_candidate_count))]
+
+    fallback_end = min(duration, max(0.0, cycle_count * 60.0 / max(params.min_bpm, 1.0)))
     fallback = {
         "start_seconds": 0.0,
-        "end_seconds": min(duration, fallback_period * n_intervals),
-        "duration_seconds": max(0.0, min(duration, fallback_period * n_intervals)),
-        "num_beats": n_intervals,
-        "local_bpm": float(60.0 / fallback_period) if fallback_period > 0 else 0.0,
+        "end_seconds": fallback_end,
+        "duration_seconds": fallback_end,
+        "cycle_count": cycle_count,
+        "local_bpm": None,
         "ibi_std_seconds": None,
         "regularity_score": None,
         "envelope_snr_db": None,
+        "heart_to_gap_contrast_db": None,
+        "gap_rms_dbfs": None,
         "quality_score": 0.0,
-        "method": "fallback_autocorr_period",
+        "method": "fallback_insufficient_cycles",
+        "is_fallback": True,
     }
     return fallback, [{**fallback, "rank": 1}]
 
 
 def estimate_envelope_snr(
-    envelope: np.ndarray, sr: int, start_seconds: float, end_seconds: float, beat_times: np.ndarray
+    envelope: np.ndarray,
+    sr: int,
+    start_seconds: float,
+    end_seconds: float,
+    beat_times: np.ndarray,
 ) -> float:
     if not len(envelope) or sr <= 0:
         return 0.0
@@ -850,68 +1198,142 @@ def estimate_envelope_snr(
     return float(20.0 * math.log10((peak_level + 1e-6) / (baseline + 1e-6)))
 
 
-def cut_loop(
-    x: np.ndarray, sr: int, loop_info: dict[str, Any], params: ProcessingParams
+def cut_cleanest_heartbeat_segment(
+    x: np.ndarray,
+    sr: int,
+    segment_info: dict[str, Any],
+    params: ProcessingParams,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     if not len(x):
-        return x.copy(), {"adjusted_start_seconds": 0.0, "adjusted_end_seconds": 0.0, "boundary_jump": 0.0}
-    start = int(max(0, min(len(x) - 1, round(loop_info["start_seconds"] * sr))))
-    end = int(max(start + 1, min(len(x), round(loop_info["end_seconds"] * sr))))
-    search = max(1, int(params.zero_crossing_search_ms * sr / 1000.0))
-    start_adj = nearest_zero_crossing(x, start, search)
-    end_adj = nearest_zero_crossing(x, end, search)
-    if end_adj <= start_adj:
-        start_adj, end_adj = start, end
-    segment = x[start_adj:end_adj].astype(np.float32).copy()
+        return x.copy(), {
+            "adjusted_start_seconds": 0.0,
+            "adjusted_end_seconds": 0.0,
+            "adjusted_duration_seconds": 0.0,
+            "boundary_jump_before_fade": 0.0,
+        }
+    start = int(max(0, min(len(x) - 1, round(float(segment_info["start_seconds"]) * sr))))
+    end = int(max(start + 1, min(len(x), round(float(segment_info["end_seconds"]) * sr))))
+    search = max(1, int(round(params.segment_zero_crossing_search_ms * sr / 1000.0)))
+    start_adjusted = nearest_zero_crossing(x, start, search)
+    end_adjusted = nearest_zero_crossing(x, end, search)
+    if end_adjusted <= start_adjusted:
+        start_adjusted, end_adjusted = start, end
+    segment = x[start_adjusted:end_adjusted].astype(np.float32, copy=True)
     boundary_jump = float(abs(segment[-1] - segment[0])) if len(segment) else 0.0
-    segment = apply_edge_fades(segment, sr, params.crossfade_ms)
+    segment = apply_edge_fades(segment, sr, params.segment_edge_fade_ms)
     return segment, {
-        "adjusted_start_seconds": float(start_adj / sr),
-        "adjusted_end_seconds": float(end_adj / sr),
+        "adjusted_start_seconds": float(start_adjusted / sr),
+        "adjusted_end_seconds": float(end_adjusted / sr),
         "adjusted_duration_seconds": float(len(segment) / sr),
-        "crossfade_ms": float(params.crossfade_ms),
+        "edge_fade_ms": float(params.segment_edge_fade_ms),
         "boundary_jump_before_fade": boundary_jump,
     }
 
 
 def nearest_zero_crossing(x: np.ndarray, center: int, radius: int) -> int:
-    lo = max(0, center - radius)
-    hi = min(len(x) - 1, center + radius)
-    if hi <= lo:
+    lower = max(0, center - radius)
+    upper = min(len(x) - 1, center + radius)
+    if upper <= lower:
         return center
-    local = x[lo : hi + 1]
+    local = x[lower : upper + 1]
     sign_changes = np.where(np.diff(np.signbit(local)))[0]
     if len(sign_changes):
-        candidates = lo + sign_changes
+        candidates = lower + sign_changes
         return int(candidates[np.argmin(np.abs(candidates - center))])
-    return int(lo + np.argmin(np.abs(local)))
+    return int(lower + np.argmin(np.abs(local)))
 
 
 def apply_edge_fades(x: np.ndarray, sr: int, fade_ms: float) -> np.ndarray:
     if not len(x) or fade_ms <= 0:
         return x
-    n = min(len(x) // 2, max(1, int(fade_ms * sr / 1000.0)))
-    if n <= 1:
+    count = min(len(x) // 2, max(1, int(round(fade_ms * sr / 1000.0))))
+    if count <= 1:
         return x
-    y = x.copy()
-    ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
-    y[:n] *= ramp
-    y[-n:] *= ramp[::-1]
-    return y
+    output = x.astype(np.float32, copy=True)
+    ramp = np.linspace(0.0, 1.0, count, dtype=np.float32)
+    output[:count] *= ramp
+    output[-count:] *= ramp[::-1]
+    return output
+
+
+def optimize_loop_playback_loudness(
+    x: np.ndarray,
+    params: ProcessingParams,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Create a clearly labelled playback copy; the faithful loop remains unchanged."""
+    if not len(x) or float(np.max(np.abs(x))) <= 1e-12:
+        return x.astype(np.float32, copy=True), {
+            "applied": False,
+            "reason": "empty_or_silent",
+            "is_playback_optimized": True,
+        }
+
+    target_peak = peak_from_dbfs(params.playback_loop_peak_dbfs)
+    target_rms = peak_from_dbfs(params.playback_loop_target_rms_dbfs)
+    normalized = x.astype(np.float64) / float(np.max(np.abs(x)))
+
+    def compressed(drive: float) -> np.ndarray:
+        if drive <= 1e-4:
+            curved = normalized
+        else:
+            curved = np.tanh(drive * normalized) / math.tanh(drive)
+        return curved * target_peak
+
+    lower = 0.0
+    upper = max(0.0, float(params.playback_loop_max_softclip_drive))
+    output = compressed(lower)
+    drive_used = 0.0
+    if float(np.sqrt(np.mean(np.square(output)))) < target_rms and upper > 0:
+        for _ in range(32):
+            midpoint = 0.5 * (lower + upper)
+            candidate = compressed(midpoint)
+            candidate_rms = float(np.sqrt(np.mean(np.square(candidate))))
+            if candidate_rms < target_rms:
+                lower = midpoint
+            else:
+                upper = midpoint
+                output = candidate
+        output = compressed(upper)
+        drive_used = upper
+
+    output = np.clip(output, -target_peak, target_peak).astype(np.float32)
+    output_rms = float(np.sqrt(np.mean(np.square(output))))
+    return output, {
+        "applied": True,
+        "method": "monotonic_tanh_soft_compression",
+        "is_playback_optimized": True,
+        "template_replacement": False,
+        "minimum_target_rms_dbfs": float(params.playback_loop_target_rms_dbfs),
+        "achieved_rms_dbfs": dbfs(output_rms),
+        "target_peak_dbfs": float(params.playback_loop_peak_dbfs),
+        "achieved_peak_dbfs": dbfs(float(np.max(np.abs(output)))),
+        "softclip_drive": float(drive_used),
+        "max_softclip_drive": float(params.playback_loop_max_softclip_drive),
+    }
 
 
 def compute_quality(
     raw_mono: np.ndarray,
+    spectral_filtered: np.ndarray,
     cleaned: np.ndarray,
     sr: int,
     source_info: dict[str, Any],
     params: ProcessingParams,
     beat_times: np.ndarray,
+    cycle_consistency: dict[str, Any],
+    rhythm_preservation: dict[str, Any],
 ) -> dict[str, Any]:
     rms = float(np.sqrt(np.mean(cleaned * cleaned))) if len(cleaned) else 0.0
     peak = float(np.max(np.abs(cleaned))) if len(cleaned) else 0.0
     clipping_fraction = float(np.mean(np.abs(raw_mono) >= 0.999)) if len(raw_mono) else 0.0
-    coverage = beat_window_coverage(len(cleaned), sr, beat_times, params)
+    core_mask = cycle_aware_heartbeat_mask(
+        len(cleaned), sr, beat_times, params, cycle_consistency
+    )
+    coverage = float(np.mean(core_mask)) if len(core_mask) else 0.0
+    interbeat_mask = ~core_mask if len(core_mask) else core_mask
+    interbeat_reduction_db = rms_ratio_db(cleaned, spectral_filtered, interbeat_mask)
+    heartbeat_energy_change_db = rms_ratio_db(cleaned, spectral_filtered, core_mask)
+    heartbeat_preservation_correlation = masked_correlation(spectral_filtered, cleaned, core_mask)
     return {
         "rms_dbfs": dbfs(rms),
         "peak_dbfs": dbfs(peak),
@@ -920,10 +1342,98 @@ def compute_quality(
         "is_clipping_suspected": bool(clipping_fraction > 0.0005),
         "duration_seconds": float(len(raw_mono) / sr) if sr else 0.0,
         "channels": source_info["channels"],
-        "speech_suppression_enabled": bool(params.enable_speech_suppression),
+        "denoising_enabled": bool(params.enable_denoising),
         "beat_window_coverage_fraction": coverage,
-        "between_beat_attenuation_db": float(params.between_beat_attenuation_db),
+        "requested_between_beat_attenuation_db": float(params.between_beat_attenuation_db),
+        "between_beat_attenuation_db": effective_between_beat_attenuation_db(params, cycle_consistency),
+        "interbeat_noise_reduction_db": interbeat_reduction_db,
+        "heartbeat_energy_change_db": heartbeat_energy_change_db,
+        "heartbeat_preservation_correlation": heartbeat_preservation_correlation,
+        "cycle_consistency_applied": bool(cycle_consistency.get("applied", False)),
+        "cycle_outlier_fraction": float(cycle_consistency.get("outlier_fraction", 0.0)),
+        "cycle_outlier_mean_gain_db": float(cycle_consistency.get("mean_gain_db_on_outliers", 0.0)),
+        "rhythm_preservation": rhythm_preservation,
+        "reconstruction_policy": "attenuation_only_no_template_replacement",
     }
+
+
+def beat_window_mask(
+    sample_count: int, sr: int, beat_times: np.ndarray, params: ProcessingParams
+) -> np.ndarray:
+    mask = np.zeros(max(0, sample_count), dtype=bool)
+    if not sample_count or not sr:
+        return mask
+    pre = max(0, int(params.beat_gate_pre_ms * sr / 1000.0))
+    post = max(1, int(params.beat_gate_post_ms * sr / 1000.0))
+    for time_seconds in beat_times:
+        center = int(round(float(time_seconds) * sr))
+        mask[max(0, center - pre) : min(sample_count, center + post)] = True
+    return mask
+
+
+def cycle_aware_heartbeat_mask(
+    sample_count: int,
+    sr: int,
+    beat_times: np.ndarray,
+    params: ProcessingParams,
+    cycle_consistency: dict[str, Any] | None,
+) -> np.ndarray:
+    mask = beat_window_mask(sample_count, sr, beat_times, params)
+    info = cycle_consistency or {}
+    core_ranges = info.get("core_phase_ranges", [])
+    beats = np.asarray(beat_times, dtype=np.float64)
+    if not info.get("applied") or not core_ranges or len(beats) < 2 or not sample_count or not sr:
+        return mask
+
+    median_period = float(info.get("median_period_seconds") or np.median(np.diff(beats)))
+    pre_seconds = max(0.0, params.beat_gate_pre_ms / 1000.0)
+    guard = max(1, int(round(params.cycle_core_gate_guard_ms * sr / 1000.0)))
+    for index, period in enumerate(np.diff(beats)):
+        if period < 0.70 * median_period or period > 1.30 * median_period:
+            continue
+        cycle_start = beats[index] - pre_seconds
+        for phase_start, phase_end in core_ranges:
+            start = int(round((cycle_start + float(phase_start) * period) * sr)) - guard
+            end = int(round((cycle_start + float(phase_end) * period) * sr)) + guard
+            mask[max(0, start) : min(sample_count, end)] = True
+    return mask
+
+
+def masked_rms(x: np.ndarray, mask: np.ndarray) -> float:
+    count = min(len(x), len(mask))
+    if not count:
+        return 0.0
+    selected = mask[:count]
+    if not np.any(selected):
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(x[:count][selected], dtype=np.float64))))
+
+
+def rms_ratio_db(numerator: np.ndarray, denominator: np.ndarray, mask: np.ndarray) -> float | None:
+    if not len(numerator) or not len(denominator) or not len(mask) or not np.any(mask):
+        return None
+    count = min(len(numerator), len(denominator), len(mask))
+    selected = mask[:count]
+    if not np.any(selected):
+        return None
+    numerator_rms = float(np.sqrt(np.mean(np.square(numerator[:count][selected]))))
+    denominator_rms = float(np.sqrt(np.mean(np.square(denominator[:count][selected]))))
+    return float(20.0 * np.log10((numerator_rms + 1e-12) / (denominator_rms + 1e-12)))
+
+
+def masked_correlation(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> float | None:
+    if not len(a) or not len(b) or not len(mask) or not np.any(mask):
+        return None
+    count = min(len(a), len(b), len(mask))
+    selected = mask[:count]
+    av = a[:count][selected].astype(np.float64)
+    bv = b[:count][selected].astype(np.float64)
+    if len(av) < 2:
+        return None
+    av -= float(np.mean(av))
+    bv -= float(np.mean(bv))
+    denom = float(np.linalg.norm(av) * np.linalg.norm(bv))
+    return float(np.dot(av, bv) / denom) if denom > 1e-12 else None
 
 
 def beat_window_coverage(
@@ -958,17 +1468,21 @@ def assess_recording_quality(
     window_analysis: list[dict[str, Any]],
     base_quality: dict[str, Any],
     template_info: dict[str, Any],
+    cycle_consistency: dict[str, Any],
 ) -> dict[str, Any]:
     """Produce a conservative recording-usability score, not a medical diagnosis."""
     reasons: list[str] = []
+    rerecord_reasons: list[str] = []
     score = 100.0
     duration = float(len(raw_mono) / sr) if sr else 0.0
     if duration < 8.0:
         score -= 25.0
         reasons.append("Recording is shorter than 8 seconds; BPM consensus is less reliable.")
+        rerecord_reasons.append("The recording is too short for reliable cycle-consistency denoising.")
     if base_quality["is_clipping_suspected"]:
         score -= 25.0
         reasons.append("Input clipping was detected.")
+        rerecord_reasons.append("Input clipping cannot be repaired without inventing waveform detail.")
 
     filtered_rms = float(np.sqrt(np.mean(filtered * filtered))) if len(filtered) else 0.0
     raw_rms = float(np.sqrt(np.mean(raw_mono * raw_mono))) if len(raw_mono) else 0.0
@@ -982,6 +1496,7 @@ def assess_recording_quality(
     if beat_count < 4 or (expected_beats >= 4 and beat_count < expected_beats * 0.45):
         score -= 20.0
         reasons.append("Too few reliable heartbeat peaks were detected.")
+        rerecord_reasons.append("Too few reliable heartbeats were found to preserve S1/S2 safely.")
 
     consensus_windows = int(bpm_info.get("consensus_window_count", 0))
     window_count = int(bpm_info.get("window_count", 0))
@@ -1001,19 +1516,57 @@ def assess_recording_quality(
             score -= 12.0
             reasons.append("Many candidate beats do not match the learned heartbeat template.")
 
+    cycle_correlation = cycle_consistency.get("median_cycle_correlation")
+    cycle_outlier_fraction = float(cycle_consistency.get("outlier_fraction", 0.0))
+    if cycle_consistency.get("enabled") and not cycle_consistency.get("applied"):
+        score -= 10.0
+        reasons.append("Too few regular cycles were available for cycle-consistency denoising.")
+    if cycle_correlation is not None and float(cycle_correlation) < 0.25:
+        score -= 18.0
+        reasons.append("Heartbeat cycles are weakly consistent after alignment.")
+        if cycle_outlier_fraction > 0.15:
+            rerecord_reasons.append("Cycle inconsistency and transient contamination are both high.")
+    if cycle_outlier_fraction > 0.20:
+        score -= 15.0
+        reasons.append("A large fraction of the recording contains non-repeating transient energy.")
+
+    preservation = base_quality.get("heartbeat_preservation_correlation")
+    if preservation is not None and float(preservation) < 0.85:
+        score -= 25.0
+        reasons.append("Denoising changed the protected heartbeat waveform too strongly.")
+        rerecord_reasons.append("The protected heartbeat waveform could not be preserved reliably.")
+
+    rhythm = base_quality.get("rhythm_preservation", {})
+    if rhythm.get("applied") and not rhythm.get("is_preserved"):
+        score -= 25.0
+        reasons.append("Independent post-denoising detection did not preserve enough heartbeat timing events.")
+        rerecord_reasons.append(
+            "Heartbeat count or timing could not be verified after denoising; exporting it as reliable would be unsafe."
+        )
+
     score = float(np.clip(score, 0.0, 100.0))
-    if score >= 75.0:
+    needs_rerecording = bool(rerecord_reasons)
+    if needs_rerecording:
+        grade = "needs_rerecording"
+        denoising_status = "rerecord"
+    elif score >= 75.0:
         grade = "good"
+        denoising_status = "ok"
     elif score >= 50.0:
         grade = "usable_with_caution"
+        denoising_status = "limited"
     else:
         grade = "poor"
+        denoising_status = "limited"
     if not reasons:
         reasons.append("No major automated recording-quality issue was detected.")
     return {
         "score": score,
         "grade": grade,
-        "is_recommended_for_loop": bool(score >= 50.0 and beat_count >= 4),
+        "denoising_status": denoising_status,
+        "needs_rerecording": needs_rerecording,
+        "is_safe_to_export": not needs_rerecording,
+        "rerecord_reasons": rerecord_reasons,
         "reasons": reasons,
         "metrics": {
             "duration_seconds": duration,
@@ -1024,6 +1577,21 @@ def assess_recording_quality(
             "window_count": window_count,
             "consensus_window_count": consensus_windows,
             "template_confirmation_fraction": template_info["confirmation_fraction"],
+            "cycle_consistency_applied": bool(cycle_consistency.get("applied", False)),
+            "cycle_count": int(cycle_consistency.get("cycles_used", 0)),
+            "median_cycle_correlation": cycle_correlation,
+            "cycle_outlier_fraction": cycle_outlier_fraction,
+            "interbeat_noise_reduction_db": base_quality.get("interbeat_noise_reduction_db"),
+            "heartbeat_preservation_correlation": preservation,
+            "rhythm_preservation_is_preserved": rhythm.get("is_preserved"),
+            "rhythm_preservation_matched_fraction": rhythm.get("matched_fraction"),
+            "rhythm_preservation_count_delta": rhythm.get("count_delta"),
+            "rhythm_preservation_median_timing_error_ms": rhythm.get(
+                "median_timing_error_ms"
+            ),
+            "rhythm_preservation_median_ibi_error_fraction": rhythm.get(
+                "median_ibi_error_fraction"
+            ),
         },
     }
 
@@ -1038,9 +1606,7 @@ def build_summary(
     bpm_info: dict[str, float],
     beat_times: np.ndarray,
     ibi: np.ndarray,
-    loop_info: dict[str, Any],
     template_info: dict[str, Any],
-    manual_corrections: dict[str, Any],
     params: ProcessingParams,
 ) -> dict[str, Any]:
     return {
@@ -1064,18 +1630,12 @@ def build_summary(
             "template_median_correlation": template_info["median_correlation"],
         },
         "template_confirmation": template_info,
-        "best_loop": loop_info,
-        "manual_corrections": manual_corrections,
         "parameters": asdict(params),
     }
 
 
 def dbfs(value: float) -> float:
     return float(20.0 * math.log10(max(value, 1e-12)))
-
-
-def format_optional_score(value: float | None) -> str:
-    return "manual selection" if value is None else f"{value:.1f}/100"
 
 
 def peak_from_dbfs(dbfs: float) -> float:
@@ -1135,7 +1695,6 @@ def make_diagnostic_plot(
     envelope: np.ndarray,
     beat_times: np.ndarray,
     sr: int,
-    loop_info: dict[str, Any],
     ibi: np.ndarray,
     bpm_info: dict[str, float],
     template_analysis: list[dict[str, Any]],
@@ -1143,8 +1702,8 @@ def make_diagnostic_plot(
     fig, axes = plt.subplots(5, 1, figsize=(12, 11), sharex=False)
     fig.suptitle(f"Heartbeat preprocessing diagnostics: {stem}")
     plot_signal(axes[0], raw, sr, "Raw mono waveform")
-    plot_signal(axes[1], filtered, sr, "Speech-suppressed detection signal (band-pass + HPSS + spectral gate)")
-    plot_signal(axes[2], cleaned, sr, "Cleaned heartbeat audio (beat-synchronous soft gate applied)")
+    plot_signal(axes[1], filtered, sr, "Cycle-consistent signal (spectral gate + transient outlier attenuation)")
+    plot_signal(axes[2], cleaned, sr, "Final denoised heartbeat (S1/S2-preserving soft gate)")
 
     t_env = np.arange(len(envelope)) / sr if len(envelope) else np.array([])
     axes[3].plot(t_env, envelope, linewidth=0.8, color="#2c7fb8")
@@ -1152,8 +1711,7 @@ def make_diagnostic_plot(
         color = "#e34a33" if item["is_confirmed"] else "#969696"
         style = "-" if item["is_confirmed"] else "--"
         axes[3].axvline(float(item["time_seconds"]), color=color, alpha=0.5, linewidth=0.8, linestyle=style)
-    axes[3].axvspan(loop_info["start_seconds"], loop_info["end_seconds"], color="#31a354", alpha=0.2)
-    axes[3].set_title("Envelope, detected beats, and selected loop")
+    axes[3].set_title("Envelope and detected heartbeat cycles")
     axes[3].set_ylabel("Envelope")
 
     if len(ibi):

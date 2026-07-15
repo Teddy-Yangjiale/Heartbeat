@@ -1,0 +1,232 @@
+import io
+import unittest
+
+import numpy as np
+from scipy.io import wavfile
+
+from heartbeat_preprocessor.core import (
+    ProcessingParams,
+    assess_recording_quality,
+    cycle_consistency_denoise,
+    measure_rhythm_preservation,
+    process_audio_bytes,
+)
+
+
+def heartbeat_signal(sr: int, seconds: float, beats: np.ndarray, seed: int = 7) -> np.ndarray:
+    time = np.arange(int(sr * seconds), dtype=np.float32) / sr
+    heart = np.zeros_like(time)
+    rng = np.random.default_rng(seed)
+    for beat in beats:
+        for offset, scale in ((0.0, 1.0), (0.22, 0.62)):
+            start = int((beat + offset) * sr)
+            length = int(0.055 * sr)
+            if start < 0 or start + length > len(heart):
+                continue
+            burst = rng.standard_normal(length).astype(np.float32) * np.hanning(length).astype(np.float32)
+            heart[start : start + length] += scale * burst
+    return heart
+
+
+def wav_data(sr: int, signal_data: np.ndarray) -> bytes:
+    buffer = io.BytesIO()
+    wavfile.write(buffer, sr, (np.clip(signal_data, -1.0, 1.0) * 32767).astype(np.int16))
+    return buffer.getvalue()
+
+
+class HeartbeatDenoisingTest(unittest.TestCase):
+    def test_reduces_sustained_voice_between_beats(self) -> None:
+        sr = 8000
+        seconds = 12
+        time = np.arange(sr * seconds, dtype=np.float32) / sr
+        beats = np.arange(0.8, seconds - 0.5, 0.8)
+        voice = 0.22 * (np.sin(2 * np.pi * 110 * time) + 0.45 * np.sin(2 * np.pi * 220 * time))
+        pcm = voice + 0.55 * heartbeat_signal(sr, seconds, beats)
+
+        without_denoising = process_audio_bytes(
+            "synthetic_voice_contaminated.wav",
+            wav_data(sr, pcm),
+            ProcessingParams(enable_denoising=False),
+        )
+        with_denoising = process_audio_bytes("synthetic_voice_contaminated.wav", wav_data(sr, pcm))
+
+        between_beats = np.zeros_like(time, dtype=bool)
+        for beat in beats:
+            between_beats |= (time >= beat + 0.38) & (time <= beat + 0.68)
+
+        def rms(signal_data: np.ndarray) -> float:
+            return float(np.sqrt(np.mean(np.square(signal_data[between_beats]))))
+
+        reduction_db = 20.0 * np.log10(
+            (rms(with_denoising["cleaned"]) + 1e-12)
+            / (rms(without_denoising["cleaned"]) + 1e-12)
+        )
+        self.assertLess(reduction_db, -20.0)
+        self.assertGreaterEqual(len(with_denoising["beat_times"]), 8)
+
+    def test_cycle_consistency_reduces_non_repeating_friction_without_thinning_heartbeats(self) -> None:
+        sr = 8000
+        seconds = 15
+        time = np.arange(sr * seconds, dtype=np.float32) / sr
+        beats = np.arange(0.8, seconds - 0.5, 0.8)
+        heart = heartbeat_signal(sr, seconds, beats, seed=21)
+        friction = np.zeros_like(time)
+        rng = np.random.default_rng(22)
+        contaminated_cycles = ((2, 0.38), (5, 0.51), (9, 0.34), (13, 0.57))
+        for cycle_index, offset in contaminated_cycles:
+            start = int((beats[cycle_index] + offset) * sr)
+            length = int(0.07 * sr)
+            friction[start : start + length] += (
+                0.75
+                * rng.standard_normal(length).astype(np.float32)
+                * np.hanning(length).astype(np.float32)
+            )
+
+        contaminated = 0.58 * heart + friction
+        denoised, info = cycle_consistency_denoise(contaminated, sr, beats, ProcessingParams())
+        friction_mask = np.abs(friction) > 1e-5
+        heartbeat_mask = np.abs(heart) > 0.02
+
+        def rms(signal_data: np.ndarray, mask: np.ndarray) -> float:
+            return float(np.sqrt(np.mean(np.square(signal_data[mask]))))
+
+        friction_reduction_db = 20.0 * np.log10(
+            (rms(denoised, friction_mask) + 1e-12) / (rms(contaminated, friction_mask) + 1e-12)
+        )
+        heartbeat_change_db = 20.0 * np.log10(
+            (rms(denoised, heartbeat_mask) + 1e-12) / (rms(contaminated, heartbeat_mask) + 1e-12)
+        )
+        heartbeat_correlation = float(np.corrcoef(contaminated[heartbeat_mask], denoised[heartbeat_mask])[0, 1])
+
+        self.assertTrue(info["applied"])
+        self.assertEqual(info["method"], "attenuation_only_cycle_envelope")
+        self.assertLess(friction_reduction_db, -10.0)
+        self.assertGreater(heartbeat_change_db, -1.0)
+        self.assertGreater(heartbeat_correlation, 0.99)
+
+    def test_exports_before_after_and_quality_contract(self) -> None:
+        sr = 8000
+        seconds = 15
+        beats = np.arange(0.8, seconds - 0.5, 0.8)
+        result = process_audio_bytes(
+            "contract.wav",
+            wav_data(sr, 0.55 * heartbeat_signal(sr, seconds, beats)),
+            manual_beat_times=beats,
+        )
+
+        self.assertTrue(result["cycle_consistency"]["applied"])
+        for artifact in (
+            "input_reference.wav",
+            "spectral_filtered.wav",
+            "filtered_detection.wav",
+            "cleaned.wav",
+            "cleanest_heartbeat_loop.wav",
+            "cleanest_heartbeat_loop_loud.wav",
+            "cleanest_segment.json",
+            "cleanest_segment_candidates.csv",
+            "cycle_consistency.json",
+            "rhythm_preservation.json",
+            "postprocess_beat_times.csv",
+            "recording_quality.json",
+        ):
+            self.assertIn(artifact, result["artifacts"])
+        self.assertNotIn("best_loop.wav", result["artifacts"])
+        self.assertEqual(result["cleanest_segment"]["cycle_count"], 4)
+        self.assertFalse(result["cleanest_segment"]["is_fallback"])
+        self.assertTrue(
+            result["cleanest_segment"]["playback_loudness"]["is_playback_optimized"]
+        )
+        self.assertLessEqual(
+            result["cleanest_segment"]["playback_loudness"]["achieved_peak_dbfs"],
+            -0.99,
+        )
+        self.assertEqual(
+            result["summary"]["quality"]["reconstruction_policy"],
+            "attenuation_only_no_template_replacement",
+        )
+        rhythm = result["rhythm_preservation"]
+        self.assertTrue(rhythm["applied"])
+        self.assertTrue(rhythm["is_preserved"])
+        self.assertGreaterEqual(rhythm["matched_fraction"], 0.95)
+        self.assertEqual(rhythm["count_delta"], 0)
+
+    def test_rhythm_check_rejects_a_destroyed_postprocess_signal(self) -> None:
+        sr = 8000
+        seconds = 12
+        beats = np.arange(0.8, seconds - 0.5, 0.8)
+        rhythm = measure_rhythm_preservation(
+            np.zeros(sr * seconds, dtype=np.float32),
+            sr,
+            beats,
+            0.8,
+            ProcessingParams(),
+        )
+
+        self.assertTrue(rhythm["applied"])
+        self.assertFalse(rhythm["is_preserved"])
+        self.assertEqual(rhythm["processed_beat_count"], 0)
+        self.assertEqual(rhythm["matched_beat_count"], 0)
+        self.assertEqual(rhythm["count_delta"], -len(beats))
+
+    def test_failed_rhythm_verification_forces_rerecording(self) -> None:
+        sr = 8000
+        seconds = 12
+        beats = np.arange(0.8, seconds - 0.5, 0.8)
+        raw = heartbeat_signal(sr, seconds, beats)
+        envelope = np.abs(raw)
+        quality = assess_recording_quality(
+            raw,
+            raw,
+            envelope,
+            beats,
+            sr,
+            {
+                "estimated_bpm": 75.0,
+                "consensus_window_count": 3,
+                "window_count": 3,
+            },
+            [],
+            {
+                "is_clipping_suspected": False,
+                "interbeat_noise_reduction_db": -10.0,
+                "heartbeat_preservation_correlation": 1.0,
+                "rhythm_preservation": {
+                    "applied": True,
+                    "is_preserved": False,
+                    "matched_fraction": 0.5,
+                    "count_delta": -7,
+                    "median_timing_error_ms": 20.0,
+                    "median_ibi_error_fraction": 0.01,
+                },
+            },
+            {
+                "enabled": False,
+                "candidate_count": len(beats),
+                "confirmation_fraction": 1.0,
+            },
+            {
+                "enabled": False,
+                "applied": False,
+                "outlier_fraction": 0.0,
+                "cycles_used": 0,
+            },
+        )
+
+        self.assertTrue(quality["needs_rerecording"])
+        self.assertEqual(quality["denoising_status"], "rerecord")
+        self.assertTrue(
+            any("count or timing" in reason.lower() for reason in quality["rerecord_reasons"])
+        )
+
+    def test_irrecoverable_clipping_requests_rerecording(self) -> None:
+        sr = 8000
+        clipped = np.ones(sr * 10, dtype=np.float32)
+        result = process_audio_bytes("clipped.wav", wav_data(sr, clipped))
+        quality = result["recording_quality"]
+        self.assertTrue(quality["needs_rerecording"])
+        self.assertEqual(quality["denoising_status"], "rerecord")
+        self.assertTrue(any("clipping" in reason.lower() for reason in quality["rerecord_reasons"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

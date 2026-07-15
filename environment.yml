@@ -10,9 +10,5 @@ dependencies:
   - pip
   - pip:
       - streamlit
-      - opencv-python
-      - moviepy
-      - pydub
       - librosa
       - soundfile
-      - imageio-ffmpeg
