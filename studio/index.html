@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#121418">
+  <title>Heartbeat Studio</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">HB</span>
+      <span><strong>Heartbeat Studio</strong><small>Song-aligned cardiac percussion</small></span>
+    </div>
+    <div class="transport" aria-label="Transport controls">
+      <button id="toStart" class="icon-button" aria-label="Return to start">|◀</button>
+      <button id="play" class="transport-main" aria-label="Play">▶</button>
+      <button id="stop" class="icon-button" aria-label="Stop">■</button>
+      <div class="time-display"><span id="timeNow">00:00.000</span><small id="barBeat">BAR 1 · BEAT 1</small></div>
+    </div>
+    <div class="tempo-strip">
+      <label>BPM<input id="bpm" type="number" min="20" max="300" step="0.1" value="120"></label>
+      <label class="auto-toggle">AUTO<input id="autoBpm" type="checkbox" checked></label>
+      <label>METER<select id="meter"><option value="3">3/4</option><option value="4" selected>4/4</option><option value="5">5/4</option><option value="6">6/4</option><option value="7">7/4</option></select></label>
+      <label>SNAP<select id="snap"><option value="1">Beat</option><option value="0.5">1/2 beat</option><option value="0.25">1/4 beat</option><option value="0">Off</option></select></label>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <aside class="browser-panel">
+      <div class="panel-title"><span>PROJECT</span><span id="saveState" class="state-dot">NEW</span></div>
+      <section class="upload-card">
+        <label class="file-slot" id="heartbeatSlot">
+          <span class="file-icon heartbeat-icon">♥</span>
+          <span><strong>Heartbeat</strong><small id="heartbeatName">Drop WAV / MP3</small></span>
+          <input id="heartbeatFile" type="file" accept="audio/wav,audio/mpeg,.wav,.mp3">
+        </label>
+        <label class="file-slot" id="songSlot">
+          <span class="file-icon song-icon">♫</span>
+          <span><strong>Target song</strong><small id="songName">Drop WAV / MP3</small></span>
+          <input id="songFile" type="file" accept="audio/wav,audio/mpeg,.wav,.mp3">
+        </label>
+        <button id="analyze" class="primary-action">Analyze & build session</button>
+        <div id="progress" class="progress" hidden><span></span></div>
+      </section>
+
+      <section class="inspector">
+        <div class="section-heading">ALIGNMENT</div>
+        <label>First beat / phase <output id="phaseValue">0.000 s</output><input id="phase" type="range" min="0" max="4" step="0.001" value="0"></label>
+        <label>Heartbeat gain <output id="gainValue">-15.0 dB</output><input id="heartbeatGain" type="range" min="-36" max="3" step="0.1" value="-15"></label>
+        <label>Loop intervals <input id="loopBeats" type="number" min="1" max="32" value="4"></label>
+        <label class="check-row"><input id="stems" type="checkbox"><span>Separate vocals / accompaniment</span></label>
+        <label class="check-row"><input id="melody" type="checkbox" disabled><span>Extract vocal melody</span></label>
+        <div id="renderNotice" class="render-notice" hidden>Arrangement changed — render to hear phase/BPM edits.</div>
+        <button id="render" class="secondary-action" disabled>Render current arrangement</button>
+      </section>
+
+      <section class="analysis-card">
+        <div class="section-heading">ANALYSIS</div>
+        <dl>
+          <div><dt>Beat confidence</dt><dd id="confidence">—</dd></div>
+          <div><dt>Grid P95 error</dt><dd id="gridError">—</dd></div>
+          <div><dt>Heartbeat BPM</dt><dd id="heartBpm">—</dd></div>
+          <div><dt>Loop length</dt><dd id="loopDuration">—</dd></div>
+        </dl>
+        <div id="warnings" class="warnings"></div>
+      </section>
+    </aside>
+
+    <section class="arrangement">
+      <div class="arrangement-toolbar">
+        <div><strong>ARRANGEMENT</strong><span id="projectName">Untitled session</span></div>
+        <div class="zoom-control"><button id="zoomOut" aria-label="Zoom out">−</button><input id="zoom" type="range" min="24" max="180" value="72"><button id="zoomIn" aria-label="Zoom in">＋</button></div>
+      </div>
+      <div id="timelineScroll" class="timeline-scroll">
+        <div id="timelineContent" class="timeline-content">
+          <div class="ruler-row"><div class="track-spacer">TIME</div><canvas id="ruler"></canvas></div>
+          <div id="trackList"></div>
+          <div id="emptyState" class="empty-state">
+            <div class="empty-grid"></div>
+            <strong>Build a session to open the arrangement</strong>
+            <span>Upload heartbeat and song audio, then analyze the beat grid.</span>
+          </div>
+          <div id="playhead" class="playhead"><span></span></div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="mixer-panel">
+      <div class="panel-title"><span>MIXER</span><span>LIVE</span></div>
+      <div id="mixerChannels" class="mixer-channels"></div>
+      <div class="master-output">
+        <div class="section-heading">EXPORT</div>
+        <a id="downloadWav" class="download disabled" href="#">Final WAV</a>
+        <a id="downloadMp3" class="download disabled" href="#">Final MP3</a>
+        <small>Rendered files include the high-quality stretched heartbeat layer.</small>
+      </div>
+    </aside>
+  </main>
+
+  <footer class="statusbar">
+    <span id="status">Ready. Audio stays on this machine.</span>
+    <span><kbd>Space</kbd> Play/Pause · <kbd>Home</kbd> Start · click timeline to seek</span>
+  </footer>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

@@ -1,10 +1,18 @@
-# Heartbeat / LegaSynth Stage 1
+# Heartbeat / LegaSynth
+
+后端 V2 的两个主处理链、模型环境、阶段 API 与验证方法见 [BACKEND_PIPELINES.md](BACKEND_PIPELINES.md)。
 
 Repository: [Teddy-Yangjiale/Heartbeat](https://github.com/Teddy-Yangjiale/Heartbeat)
 
 这是 LegaSynth 项目的第一阶段 MVP：输入心跳音频文件 `.wav` 或 `.mp3`，自动完成心跳信号预处理、节拍检测、BPM 估计、稳定 loop 选择，并导出所有中间数据、处理参数、诊断图和可下载结果。
 
-当前阶段只做心跳音频分析，不做歌曲混音、视频生成、AI 视频生成或中文翻唱。这些会放到后续阶段。
+当前仓库包含两个可独立运行的阶段：
+
+- Stage 1：心跳音频分析和 `best_loop.wav` 提取，本页面继续完整说明这一部分。
+- Stage 2：歌曲 WAV/MP3 节拍分析、心跳 loop 变速与相位对齐、心跳层/最终混音导出；详见 [STAGE2_REMIX.md](STAGE2_REMIX.md)。
+- Studio：FL Studio 风格的本地多轨网页工作台，支持波形、transport、播放头、轨道 mixer、相位拖拽和重复渲染；详见 [STUDIO.md](STUDIO.md)。
+
+中文翻译与歌声合成尚未接入；人声/伴奏分离和旋律提取已提供可选 Demucs + pYIN 后端。
 
 ## 1. 功能概览
 

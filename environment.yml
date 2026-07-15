@@ -10,6 +10,10 @@ dependencies:
   - pip
   - pip:
       - streamlit
+      - fastapi
+      - uvicorn
+      - python-multipart
+      - httpx
       - opencv-python
       - moviepy
       - pydub

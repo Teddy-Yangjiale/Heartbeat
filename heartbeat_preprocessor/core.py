@@ -58,6 +58,12 @@ class ProcessingParams:
     template_post_ms: float = 300.0
     template_correlation_threshold: float = 0.35
     min_template_beats: int = 4
+    enable_cycle_regularization: bool = True
+    cycle_search_fraction: float = 0.22
+    cycle_regularity_trigger_cv: float = 0.18
+    loop_bpm_tolerance_fraction: float = 0.12
+    loop_max_ibi_cv: float = 0.12
+    loop_max_recovered_fraction: float = 0.25
 
 
 def safe_stem(name: str) -> str:
@@ -102,9 +108,22 @@ def process_audio_bytes(
     beat_times, template_info, template_analysis, template_waveform = confirm_beats_with_template(
         filtered, candidate_beat_times, sr, bpm_info["period_seconds"], params
     )
+    beat_times, beat_diagnostics, cycle_info = regularize_cardiac_cycles(
+        envelope,
+        beat_times,
+        sr,
+        bpm_info["period_seconds"],
+        duration,
+        params,
+    )
     normalized_manual_beats = normalize_manual_beat_times(manual_beat_times, duration)
     if normalized_manual_beats is not None:
         beat_times = normalized_manual_beats
+        beat_diagnostics = [
+            {"beat_index": index, "time_seconds": float(value), "source": "manual", "confidence": 1.0}
+            for index, value in enumerate(beat_times)
+        ]
+        cycle_info = summarize_cycle_sequence(beat_times, bpm_info["period_seconds"], beat_diagnostics, "manual")
         template_info = {
             **template_info,
             "confirmed_count": int(len(beat_times)),
@@ -127,6 +146,8 @@ def process_audio_bytes(
             params.target_loop_beats,
             bpm_info["period_seconds"],
             params.loop_candidate_count,
+            beat_diagnostics=beat_diagnostics,
+            params=params,
         )
     manual_corrections = {
         "beat_times_overridden": normalized_manual_beats is not None,
@@ -145,7 +166,17 @@ def process_audio_bytes(
 
     quality = compute_quality(mono, cleaned, sr, source_info, params, beat_times)
     recording_quality = assess_recording_quality(
-        mono, filtered, envelope, beat_times, sr, bpm_info, window_analysis, quality, template_info
+        mono,
+        filtered,
+        envelope,
+        beat_times,
+        sr,
+        bpm_info,
+        window_analysis,
+        quality,
+        template_info,
+        cycle_info,
+        loop_info,
     )
     tempo_summary = build_summary(
         filename=filename,
@@ -159,13 +190,14 @@ def process_audio_bytes(
         ibi=ibi,
         loop_info={**loop_info, **loop_audio_info},
         template_info=template_info,
+        cycle_info=cycle_info,
         manual_corrections=manual_corrections,
         params=params,
     )
 
     stem = safe_stem(filename)
     envelope_df = make_envelope_frame(envelope, sr, params.export_envelope_hz)
-    beats_df = make_beats_frame(beat_times)
+    beats_df = make_beats_frame(beat_times, beat_diagnostics)
     ibi_df = make_ibi_frame(beat_times)
     window_analysis_df = pd.DataFrame(window_analysis)
     loop_candidates_df = pd.DataFrame(loop_candidates)
@@ -713,6 +745,147 @@ def _template_info(
     }
 
 
+def regularize_cardiac_cycles(
+    envelope: np.ndarray,
+    beat_times: np.ndarray,
+    sr: int,
+    expected_period_seconds: float,
+    duration: float,
+    params: ProcessingParams,
+) -> tuple[np.ndarray, list[dict[str, Any]], dict[str, Any]]:
+    """Recover a coherent cardiac-cycle sequence when isolated peak picking misses cycles.
+
+    This is a conservative timing model, not a diagnostic S1/S2 classifier. It uses
+    the autocorrelation period as a prior, optimizes a global phase, then searches
+    the envelope locally around each expected cycle. Every recovered event is
+    explicitly flagged so loop selection and quality scoring can reject it.
+    """
+    beats = np.asarray(beat_times, dtype=np.float64)
+    period = float(expected_period_seconds)
+    if len(beats) < 2 or period <= 0 or sr <= 0 or not len(envelope):
+        diagnostics = [
+            {"beat_index": index, "time_seconds": float(value), "source": "detected", "confidence": 0.5}
+            for index, value in enumerate(beats)
+        ]
+        return beats.astype(np.float32), diagnostics, summarize_cycle_sequence(beats, period, diagnostics, "unchanged")
+
+    initial_intervals = np.diff(beats)
+    initial_cv = float(np.std(initial_intervals) / (np.mean(initial_intervals) + 1e-9))
+    expected_count = duration / period
+    count_ratio = float(len(beats) / max(expected_count, 1.0))
+    should_regularize = bool(
+        params.enable_cycle_regularization
+        and (
+            initial_cv > params.cycle_regularity_trigger_cv
+            or count_ratio < 0.85
+            or count_ratio > 1.15
+        )
+    )
+    if not should_regularize:
+        diagnostics = []
+        for index, value in enumerate(beats):
+            sample = int(np.clip(round(value * sr), 0, len(envelope) - 1))
+            diagnostics.append(
+                {
+                    "beat_index": index,
+                    "time_seconds": float(value),
+                    "source": "detected",
+                    "confidence": float(np.clip(envelope[sample], 0.0, 1.0)),
+                }
+            )
+        return beats.astype(np.float32), diagnostics, summarize_cycle_sequence(beats, period, diagnostics, "peak_sequence")
+
+    search_seconds = float(np.clip(params.cycle_search_fraction * period, 0.08, 0.30))
+    phase_candidates = np.unique(np.round(np.mod(beats, period), decimals=4))
+    best_phase = float(phase_candidates[0])
+    best_score = -np.inf
+    for phase in phase_candidates:
+        grid = np.arange(float(phase), duration, period, dtype=np.float64)
+        if not len(grid):
+            continue
+        candidate_distances = np.asarray([np.min(np.abs(grid - value)) for value in beats])
+        coverage = float(np.mean(candidate_distances <= search_seconds))
+        alignment = float(np.exp(-np.median(candidate_distances) / (search_seconds + 1e-9)))
+        strengths = []
+        for center in grid:
+            lo = max(0, int(round((center - search_seconds) * sr)))
+            hi = min(len(envelope), int(round((center + search_seconds) * sr)) + 1)
+            if hi > lo:
+                strengths.append(float(np.max(envelope[lo:hi])))
+        strength = float(np.median(strengths)) if strengths else 0.0
+        score = 0.50 * coverage + 0.30 * alignment + 0.20 * strength
+        if score > best_score:
+            best_score = score
+            best_phase = float(phase)
+
+    grid = np.arange(best_phase, duration, period, dtype=np.float64)
+    regularized: list[float] = []
+    diagnostics: list[dict[str, Any]] = []
+    for center in grid:
+        lo = max(0, int(round((center - search_seconds) * sr)))
+        hi = min(len(envelope), int(round((center + search_seconds) * sr)) + 1)
+        if hi <= lo:
+            continue
+        window = envelope[lo:hi]
+        local_peaks, _ = signal.find_peaks(window, prominence=max(0.02, params.peak_prominence * 0.35))
+        if len(local_peaks):
+            peak_times = (lo + local_peaks) / float(sr)
+            peak_strengths = window[local_peaks]
+            distance_penalty = np.exp(-np.abs(peak_times - center) / (search_seconds + 1e-9))
+            selected_local = int(local_peaks[int(np.argmax(peak_strengths * distance_penalty))])
+        else:
+            selected_local = int(np.argmax(window))
+        selected_time = float((lo + selected_local) / sr)
+        if regularized and selected_time - regularized[-1] < period * 0.55:
+            continue
+        nearest_candidate = float(np.min(np.abs(beats - selected_time))) if len(beats) else float("inf")
+        source = "detected" if nearest_candidate <= period * 0.14 else "recovered"
+        shift = abs(selected_time - center)
+        amplitude = float(np.clip(envelope[lo + selected_local], 0.0, 1.0))
+        confidence = float(np.clip(0.65 * amplitude + 0.35 * np.exp(-shift / (search_seconds + 1e-9)), 0.0, 1.0))
+        regularized.append(selected_time)
+        diagnostics.append(
+            {
+                "beat_index": len(regularized) - 1,
+                "time_seconds": selected_time,
+                "source": source,
+                "confidence": confidence,
+                "expected_time_seconds": float(center),
+                "phase_error_seconds": float(selected_time - center),
+            }
+        )
+    result = np.asarray(regularized, dtype=np.float32)
+    info = summarize_cycle_sequence(result, period, diagnostics, "period_phase_regularized")
+    info["initial_detected_beats"] = int(len(beats))
+    info["initial_interval_cv"] = initial_cv
+    info["phase_seconds"] = best_phase
+    info["phase_score"] = float(best_score)
+    return result, diagnostics, info
+
+
+def summarize_cycle_sequence(
+    beat_times: np.ndarray,
+    expected_period_seconds: float,
+    diagnostics: list[dict[str, Any]],
+    method: str,
+) -> dict[str, Any]:
+    beats = np.asarray(beat_times, dtype=np.float64)
+    intervals = np.diff(beats)
+    period = max(float(expected_period_seconds), 1e-9)
+    recovered = sum(1 for row in diagnostics if row.get("source") == "recovered")
+    outlier_fraction = float(np.mean(np.abs(intervals / period - 1.0) > 0.20)) if len(intervals) else 1.0
+    return {
+        "method": method,
+        "beat_count": int(len(beats)),
+        "recovered_beat_count": int(recovered),
+        "recovered_fraction": float(recovered / len(beats)) if len(beats) else 0.0,
+        "interval_median_seconds": float(np.median(intervals)) if len(intervals) else None,
+        "interval_cv": float(np.std(intervals) / (np.mean(intervals) + 1e-9)) if len(intervals) else None,
+        "period_outlier_fraction": outlier_fraction,
+        "expected_period_seconds": float(expected_period_seconds),
+    }
+
+
 def normalize_manual_beat_times(
     manual_beat_times: np.ndarray | list[float] | None, duration: float
 ) -> np.ndarray | None:
@@ -781,8 +954,16 @@ def rank_loop_candidates(
     target_loop_beats: int,
     fallback_period: float,
     candidate_limit: int,
+    beat_diagnostics: list[dict[str, Any]] | None = None,
+    params: ProcessingParams | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    params = params or ProcessingParams()
     beats = np.asarray(beat_times, dtype=np.float64)
+    recovered_flags = np.asarray(
+        [row.get("source") == "recovered" for row in (beat_diagnostics or [])], dtype=bool
+    )
+    if len(recovered_flags) != len(beats):
+        recovered_flags = np.zeros(len(beats), dtype=bool)
     n_intervals = max(1, int(target_loop_beats))
     candidates: list[dict[str, Any]] = []
     if len(beats) >= n_intervals + 1:
@@ -796,7 +977,23 @@ def rank_loop_candidates(
             snr_db = estimate_envelope_snr(envelope, sr, start, end, beats[i : i + n_intervals + 1])
             regularity_component = float(np.exp(-7.0 * regularity))
             snr_component = float(np.clip(snr_db / 40.0, 0.0, 1.0))
-            quality_score = float(100.0 * (0.75 * regularity_component + 0.25 * snr_component))
+            median_period = float(np.median(local))
+            period_error = float(abs(median_period / max(fallback_period, 1e-9) - 1.0))
+            period_consistency = float(np.exp(-8.0 * period_error))
+            recovered_fraction = float(np.mean(recovered_flags[i : i + n_intervals + 1]))
+            quality_score = float(
+                100.0
+                * (0.45 * regularity_component + 0.25 * snr_component + 0.30 * period_consistency)
+                * (1.0 - 0.65 * recovered_fraction)
+            )
+            warnings: list[str] = []
+            if period_error > params.loop_bpm_tolerance_fraction:
+                warnings.append("Loop tempo is inconsistent with the global cardiac period.")
+            if regularity > params.loop_max_ibi_cv:
+                warnings.append("Loop IBI variation exceeds the production threshold.")
+            if recovered_fraction > params.loop_max_recovered_fraction:
+                warnings.append("Loop depends on too many recovered heartbeat events.")
+            validation_status = "ok" if not warnings else "manual_review"
             candidates.append(
                 {
                     "start_seconds": start,
@@ -806,13 +1003,20 @@ def rank_loop_candidates(
                     "local_bpm": float(60.0 / np.median(local)),
                     "ibi_std_seconds": float(np.std(local)),
                     "regularity_score": regularity,
+                    "period_error_fraction": period_error,
+                    "period_consistency_score": period_consistency,
+                    "recovered_beat_fraction": recovered_fraction,
                     "envelope_snr_db": snr_db,
                     "quality_score": quality_score,
                     "method": "regularity_and_envelope_quality",
+                    "validation": {"status": validation_status, "warnings": warnings},
                 }
             )
         if candidates:
-            candidates.sort(key=lambda item: item["quality_score"], reverse=True)
+            candidates.sort(
+                key=lambda item: (item["validation"]["status"] == "ok", item["quality_score"]),
+                reverse=True,
+            )
             for rank, candidate in enumerate(candidates, start=1):
                 candidate["rank"] = rank
             selected = dict(candidates[0])
@@ -830,6 +1034,13 @@ def rank_loop_candidates(
         "envelope_snr_db": None,
         "quality_score": 0.0,
         "method": "fallback_autocorr_period",
+        "period_error_fraction": 0.0,
+        "period_consistency_score": 1.0,
+        "recovered_beat_fraction": 1.0,
+        "validation": {
+            "status": "manual_review",
+            "warnings": ["No complete detected cardiac-cycle window was available; fallback loop was used."],
+        },
     }
     return fallback, [{**fallback, "rank": 1}]
 
@@ -958,6 +1169,8 @@ def assess_recording_quality(
     window_analysis: list[dict[str, Any]],
     base_quality: dict[str, Any],
     template_info: dict[str, Any],
+    cycle_info: dict[str, Any],
+    loop_info: dict[str, Any],
 ) -> dict[str, Any]:
     """Produce a conservative recording-usability score, not a medical diagnosis."""
     reasons: list[str] = []
@@ -1001,6 +1214,23 @@ def assess_recording_quality(
             score -= 12.0
             reasons.append("Many candidate beats do not match the learned heartbeat template.")
 
+    interval_cv = cycle_info.get("interval_cv")
+    if interval_cv is not None and interval_cv > 0.15:
+        score -= 25.0
+        reasons.append("Cardiac-cycle intervals remain too irregular for automatic loop selection.")
+    period_outlier_fraction = float(cycle_info.get("period_outlier_fraction") or 0.0)
+    if period_outlier_fraction > 0.20:
+        score -= 20.0
+        reasons.append("Too many detected cycles disagree with the autocorrelation heart period.")
+    recovered_fraction = float(cycle_info.get("recovered_fraction") or 0.0)
+    if recovered_fraction > 0.25:
+        score -= 12.0
+        reasons.append("Many heartbeat events were recovered from the period model rather than directly detected.")
+    loop_validation = loop_info.get("validation", {})
+    if loop_validation.get("status") == "manual_review":
+        score -= 20.0
+        reasons.extend(loop_validation.get("warnings", []))
+
     score = float(np.clip(score, 0.0, 100.0))
     if score >= 75.0:
         grade = "good"
@@ -1013,7 +1243,12 @@ def assess_recording_quality(
     return {
         "score": score,
         "grade": grade,
-        "is_recommended_for_loop": bool(score >= 50.0 and beat_count >= 4),
+        "is_recommended_for_loop": bool(
+            score >= 60.0
+            and beat_count >= 4
+            and loop_validation.get("status", "ok") == "ok"
+            and recovered_fraction <= 0.25
+        ),
         "reasons": reasons,
         "metrics": {
             "duration_seconds": duration,
@@ -1024,6 +1259,10 @@ def assess_recording_quality(
             "window_count": window_count,
             "consensus_window_count": consensus_windows,
             "template_confirmation_fraction": template_info["confirmation_fraction"],
+            "cycle_interval_cv": interval_cv,
+            "cycle_period_outlier_fraction": period_outlier_fraction,
+            "recovered_beat_fraction": recovered_fraction,
+            "loop_validation_status": loop_validation.get("status", "unknown"),
         },
     }
 
@@ -1040,6 +1279,7 @@ def build_summary(
     ibi: np.ndarray,
     loop_info: dict[str, Any],
     template_info: dict[str, Any],
+    cycle_info: dict[str, Any],
     manual_corrections: dict[str, Any],
     params: ProcessingParams,
 ) -> dict[str, Any]:
@@ -1064,6 +1304,7 @@ def build_summary(
             "template_median_correlation": template_info["median_correlation"],
         },
         "template_confirmation": template_info,
+        "cycle_analysis": cycle_info,
         "best_loop": loop_info,
         "manual_corrections": manual_corrections,
         "parameters": asdict(params),
@@ -1109,7 +1350,11 @@ def make_envelope_frame(envelope: np.ndarray, sr: int, export_hz: float) -> pd.D
     return pd.DataFrame({"time_seconds": idx / sr, "envelope": envelope[idx]})
 
 
-def make_beats_frame(beat_times: np.ndarray) -> pd.DataFrame:
+def make_beats_frame(
+    beat_times: np.ndarray, diagnostics: list[dict[str, Any]] | None = None
+) -> pd.DataFrame:
+    if diagnostics and len(diagnostics) == len(beat_times):
+        return pd.DataFrame(diagnostics)
     return pd.DataFrame({"beat_index": np.arange(len(beat_times)), "time_seconds": beat_times})
 
 

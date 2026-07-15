@@ -1,0 +1,23 @@
+{
+  "202607071630425298.wav": {
+    "sha256": "21043ea249bcd3778faa087e4cec52685a48341ab664fb83c6e09ae360ae25db",
+    "global_bpm_range": [65.0, 73.0],
+    "loop_bpm_range": [65.0, 75.0],
+    "max_loop_period_error": 0.08,
+    "expected_recommendation": false
+  },
+  "202607081521080317.wav": {
+    "sha256": "89e89902c2d79764482853f655436898c1521a55252372284a68059fe5ebc8c1",
+    "global_bpm_range": [72.0, 79.0],
+    "loop_bpm_range": [70.0, 80.0],
+    "max_loop_period_error": 0.08,
+    "expected_recommendation": true
+  },
+  "202607091053425340.wav": {
+    "sha256": "912ae56219a7bbec54040c99cd050fae31a57918c52d7b43c82821ad1628399c",
+    "global_bpm_range": [65.0, 72.0],
+    "loop_bpm_range": [64.0, 72.0],
+    "max_loop_period_error": 0.08,
+    "expected_recommendation": true
+  }
+}

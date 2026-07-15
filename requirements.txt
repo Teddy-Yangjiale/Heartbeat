@@ -1,4 +1,8 @@
 streamlit
+fastapi
+uvicorn
+python-multipart
+httpx
 numpy
 scipy
 pandas

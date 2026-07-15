@@ -1,0 +1,19 @@
+name: heartbeat-music
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # BeatNet/madmom still requires the NumPy 1.x ABI, so heavy pretrained
+  # music models are deliberately isolated from the Python 3.11 web API.
+  - python=3.9
+  - numpy=1.20.3
+  - scipy=1.7.3
+  - numba=0.54.1
+  - cython=0.29.36
+  - ffmpeg
+  - pip
+  - pip:
+      - demucs
+      - BeatNet
+      - PyAudio
+      - basic-pitch
