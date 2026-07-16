@@ -6,3 +6,5 @@ outputs/
 tmp/
 .pytest_cache/
 work/
+data/external/
+data/generated/

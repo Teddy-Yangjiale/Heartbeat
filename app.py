@@ -1,289 +1,233 @@
 from __future__ import annotations
 
-from datetime import datetime
-from pathlib import Path
-
-import pandas as pd
 import streamlit as st
 
-from heartbeat_preprocessor.core import (
-    ProcessingParams,
-    make_batch_zip,
-    process_audio_bytes,
-    save_result_to_dir,
-)
+from heartbeat_preprocessor.core import ProcessingParams, process_audio_bytes
 
 
-st.set_page_config(page_title="LegaSynth Heartbeat Audio Analysis", layout="wide")
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_DURATION_SECONDS = 30.0
+
+
+st.set_page_config(page_title="Heartbeat WAV Denoiser", layout="wide")
 
 
 def sidebar_params() -> ProcessingParams:
-    st.sidebar.header("Preprocessing Parameters")
-    low = st.sidebar.slider("Band-pass low cutoff (Hz)", 5.0, 80.0, 25.0, 1.0)
-    high = st.sidebar.slider("Band-pass high cutoff (Hz)", 80.0, 500.0, 160.0, 5.0)
-    env_lp = st.sidebar.slider("Envelope low-pass (Hz)", 2.0, 20.0, 6.0, 0.5)
-    min_bpm = st.sidebar.slider("Minimum plausible BPM", 30.0, 80.0, 40.0, 1.0)
-    max_bpm = st.sidebar.slider("Maximum plausible BPM", 90.0, 180.0, 140.0, 1.0)
-    prominence = st.sidebar.slider("Peak prominence", 0.01, 0.60, 0.12, 0.01)
-    height_pct = st.sidebar.slider("Peak height percentile", 40.0, 90.0, 65.0, 1.0)
-    double_peak_suppression = st.sidebar.slider("Double-peak suppression", 0.40, 0.90, 0.65, 0.01)
-    loop_beats = st.sidebar.slider("Target loop length (beats)", 2, 12, 4, 1)
-    crossfade_ms = st.sidebar.slider("Loop edge fade (ms)", 0.0, 80.0, 12.0, 1.0)
-    export_peak_dbfs = st.sidebar.slider(
-        "Export output peak (dBFS)",
-        -24.0,
-        -0.1,
-        -1.94,
-        0.1,
-        help="Higher values are louder. -0.1 dBFS is the loudest setting and retains a small margin below digital clipping.",
-    )
-
-    st.sidebar.subheader("Speech and noise suppression")
-    suppression_enabled = st.sidebar.checkbox("Enable speech/noise suppression", value=True)
-    suppression_profile = st.sidebar.select_slider(
-        "Suppression strength",
+    st.sidebar.header("Denoising")
+    profile = st.sidebar.select_slider(
+        "Strength",
         options=["Mild", "Balanced", "Strong"],
         value="Balanced",
-        disabled=not suppression_enabled,
-        help="Strong mode removes more talking between heartbeats, but can make weak S1/S2 sounds quieter.",
+        help="Use Mild when S1/S2 sounds thin. Strong is intended for clearly contaminated recordings.",
     )
     profiles = {
-        "Mild": {"hpss_margin": 1.4, "spectral_reduction_strength": 0.85, "between_beat_attenuation_db": -18.0, "beat_gate_post_ms": 260.0},
-        "Balanced": {"hpss_margin": 2.0, "spectral_reduction_strength": 1.15, "between_beat_attenuation_db": -28.0, "beat_gate_post_ms": 300.0},
-        "Strong": {"hpss_margin": 2.8, "spectral_reduction_strength": 1.45, "between_beat_attenuation_db": -36.0, "beat_gate_post_ms": 340.0},
+        "Mild": {
+            "spectral_reduction_strength": 0.80,
+            "spectral_floor_db": -24.0,
+            "cycle_outlier_attenuation_db": -12.0,
+            "between_beat_attenuation_db": -18.0,
+        },
+        "Balanced": {
+            "spectral_reduction_strength": 1.00,
+            "spectral_floor_db": -30.0,
+            "cycle_outlier_attenuation_db": -18.0,
+            "between_beat_attenuation_db": -28.0,
+        },
+        "Strong": {
+            "spectral_reduction_strength": 1.25,
+            "spectral_floor_db": -36.0,
+            "cycle_outlier_attenuation_db": -24.0,
+            "between_beat_attenuation_db": -36.0,
+        },
     }
-    speech_suppression_params = profiles[suppression_profile]
-    st.sidebar.subheader("Heartbeat template confirmation")
-    template_enabled = st.sidebar.checkbox("Confirm beats with heartbeat template", value=True)
-    template_threshold = st.sidebar.slider(
-        "Template correlation threshold", 0.10, 0.90, 0.35, 0.05, disabled=not template_enabled
+    export_peak_dbfs = st.sidebar.slider(
+        "Output peak (dBFS)",
+        -24.0,
+        -0.1,
+        -1.9,
+        0.1,
+        help="Changes export level only; it does not make the denoising more aggressive.",
     )
-    return ProcessingParams(
-        bandpass_low_hz=low,
-        bandpass_high_hz=high,
-        envelope_lowpass_hz=env_lp,
-        min_bpm=min_bpm,
-        max_bpm=max_bpm,
-        peak_prominence=prominence,
-        peak_height_percentile=height_pct,
-        double_peak_suppression=double_peak_suppression,
-        target_loop_beats=loop_beats,
-        crossfade_ms=crossfade_ms,
-        export_peak_dbfs=export_peak_dbfs,
-        enable_speech_suppression=suppression_enabled,
-        enable_template_confirmation=template_enabled,
-        template_correlation_threshold=template_threshold,
-        **speech_suppression_params,
+    st.sidebar.caption(
+        "The algorithm learns repetition only within this WAV. It attenuates inconsistent energy and never copies a heartbeat template into the output."
     )
+    st.sidebar.caption(
+        "Privacy: uploads and generated outputs stay in this browser session and are not saved by the web app."
+    )
+    return ProcessingParams(export_peak_dbfs=export_peak_dbfs, **profiles[profile])
 
 
-def render_result(result: dict, save_outputs: bool) -> dict | None:
+def format_metric(value: float | None, suffix: str = "") -> str:
+    return "n/a" if value is None else f"{value:.2f}{suffix}"
+
+
+def render_result(result: dict) -> None:
     summary = result["summary"]
     tempo = summary["tempo"]
-    loop = summary["best_loop"]
     quality = summary["quality"]
-    recording_quality = summary["recording_quality"]
+    recording = summary["recording_quality"]
+    cycle = result["cycle_consistency"]
+    rhythm = result["rhythm_preservation"]
+    focal = result["focal_cycle_contamination"]
 
-    st.subheader(result["name"])
-    cols = st.columns(7)
-    cols[0].metric("Duration", f"{summary['duration_seconds']:.2f}s")
-    cols[1].metric("Sample Rate", f"{summary['sample_rate']} Hz")
-    cols[2].metric("Estimated BPM", f"{tempo['estimated_bpm']:.1f}")
-    cols[3].metric("Detected Beats", str(tempo["detected_beats"]))
-    cols[4].metric("IBI Std", "n/a" if tempo["ibi_std_seconds"] is None else f"{tempo['ibi_std_seconds']:.3f}s")
-    cols[5].metric("Peak", f"{quality['peak_dbfs']:.1f} dBFS")
-    cols[6].metric("Recording Quality", f"{recording_quality['score']:.0f}/100", recording_quality["grade"])
+    metrics = st.columns(7)
+    metrics[0].metric("Duration", f"{summary['duration_seconds']:.2f}s")
+    metrics[1].metric("Estimated BPM", f"{tempo['estimated_bpm']:.1f}")
+    metrics[2].metric(
+        "Cycles before / after",
+        f"{rhythm['expected_beat_count']} / {rhythm['processed_beat_count']}",
+    )
+    metrics[3].metric(
+        "Rhythm match",
+        f"{rhythm['matched_fraction']:.0%}",
+    )
+    metrics[4].metric(
+        "Inter-beat reduction",
+        format_metric(quality["interbeat_noise_reduction_db"], " dB"),
+    )
+    metrics[5].metric(
+        "S1/S2 preservation",
+        format_metric(quality["heartbeat_preservation_correlation"]),
+    )
+    metrics[6].metric("Quality", f"{recording['score']:.0f}/100", recording["grade"])
 
-    if quality["is_clipping_suspected"]:
-        st.warning("Clipping is suspected in this file. Some detected peaks may be unreliable.")
-    if quality["speech_suppression_enabled"]:
+    if recording["needs_rerecording"]:
+        st.error("Re-recording is recommended. " + " ".join(recording["rerecord_reasons"]))
+    elif recording["denoising_status"] == "limited":
+        st.warning("The result is usable with caution. " + " ".join(recording["reasons"]))
+    else:
+        st.success("The recording passed the automated preservation and consistency checks.")
+
+    st.caption(
+        f"Independent post-denoising rhythm check: {rhythm['matched_beat_count']}/"
+        f"{rhythm['expected_beat_count']} beats matched; count delta {rhythm['count_delta']}; "
+        f"median timing error {format_metric(rhythm['median_timing_error_ms'], ' ms')}."
+    )
+    if focal["applied"]:
         st.caption(
-            "Speech/noise suppression is active: only "
-            f"{quality['beat_window_coverage_fraction']:.0%} of the recording is retained at full level around detected beats; "
-            f"the remaining audio is attenuated by {quality['between_beat_attenuation_db']:.0f} dB."
+            f"Focal contamination check: {focal['severe_cycle_count']} severe cycle(s); "
+            f"maximum RMS ratio {format_metric(focal['max_rms_ratio'])}; "
+            f"maximum peak ratio {format_metric(focal['max_peak_ratio'])}."
         )
-    if tempo["detected_beats"] < 4:
-        st.warning("Few beats were detected. Try lowering peak prominence or widening the BPM range.")
-    if not recording_quality["is_recommended_for_loop"]:
-        st.warning("This recording is not recommended for a production loop: " + " ".join(recording_quality["reasons"]))
 
+    if cycle["applied"]:
+        st.caption(
+            f"Cycle consistency used {cycle['cycles_used']} complete cycles; "
+            f"median correlation {cycle['median_cycle_correlation']:.3f}; "
+            f"non-repeating transient coverage {cycle['outlier_fraction']:.1%}."
+        )
+    else:
+        st.caption("Cycle consistency was not applied: " + str(cycle["reason"]))
+
+    audio = st.columns(3)
+    audio[0].write("Before: input reference")
+    audio[0].audio(result["artifacts"]["input_reference.wav"], format="audio/wav")
+    audio[1].write("Intermediate: cycle-consistent signal")
+    audio[1].audio(result["artifacts"]["filtered_detection.wav"], format="audio/wav")
+    audio[2].write("After: final denoised heartbeat")
+    audio[2].audio(result["artifacts"]["cleaned.wav"], format="audio/wav")
+
+    segment = result["cleanest_segment"]
+    st.subheader("Cleanest consecutive heartbeat segment")
     st.caption(
-        "Best loop: "
-        f"{loop['start_seconds']:.2f}s to {loop['end_seconds']:.2f}s, "
-        f"{loop['num_beats']} beats, local BPM {loop['local_bpm']:.1f}, method {loop['method']}."
+        f"Selected {segment['cycle_count']} real cycles from "
+        f"{segment['adjusted_start_seconds']:.2f}s to {segment['adjusted_end_seconds']:.2f}s; "
+        f"quality score {segment['quality_score']:.1f}/100. No template audio is copied into this segment."
     )
-    st.caption(
-        f"BPM method: {tempo['method']}; consensus windows: "
-        f"{tempo['consensus_window_count']}/{tempo['window_count']}."
-    )
-    st.caption(
-        f"Template confirmation: {tempo['template_confirmed_beats']}/{tempo['initial_detected_beats']} beats; "
-        f"median correlation: {tempo['template_median_correlation']}."
-    )
+    loop_audio = st.columns(2)
+    loop_audio[0].write("Faithful clean loop")
+    loop_audio[0].audio(result["artifacts"]["cleanest_heartbeat_loop.wav"], format="audio/wav")
+    loop_audio[1].write("Playback-loud loop")
+    loop_audio[1].audio(result["artifacts"]["cleanest_heartbeat_loop_loud.wav"], format="audio/wav")
 
-    st.image(result["artifacts"]["diagnostic_plot.png"], caption="Diagnostic plot", width='stretch')
+    st.image(result["artifacts"]["diagnostic_plot.png"], caption="Denoising diagnostics", width="stretch")
 
-    audio_cols = st.columns(3)
-    audio_cols[0].write("Cleaned heartbeat audio")
-    audio_cols[0].audio(result["artifacts"]["cleaned.wav"], format="audio/wav")
-    audio_cols[1].write("Speech-suppressed diagnostic audio")
-    audio_cols[1].audio(result["artifacts"]["filtered_detection.wav"], format="audio/wav")
-    audio_cols[2].write("Best loop")
-    audio_cols[2].audio(result["artifacts"]["best_loop.wav"], format="audio/wav")
-
-    dl_cols = st.columns(5)
-    dl_cols[0].download_button(
-        "Download result zip",
+    downloads = st.columns(6)
+    downloads[0].download_button(
+        "Download all outputs",
         result["zip_bytes"],
-        file_name=f"{result['stem']}_heartbeat_outputs.zip",
+        file_name=f"{result['stem']}_denoising_outputs.zip",
         mime="application/zip",
-        key=f"{result['stem']}_zip",
     )
-    dl_cols[1].download_button(
-        "tempo_summary.json",
-        result["artifacts"]["tempo_summary.json"],
-        file_name=f"{result['stem']}_tempo_summary.json",
-        mime="application/json",
-        key=f"{result['stem']}_json",
-    )
-    dl_cols[2].download_button(
-        "beat_times.csv",
-        result["artifacts"]["beat_times.csv"],
-        file_name=f"{result['stem']}_beat_times.csv",
-        mime="text/csv",
-        key=f"{result['stem']}_beats",
-    )
-    dl_cols[3].download_button(
-        "best_loop.wav",
-        result["artifacts"]["best_loop.wav"],
-        file_name=f"{result['stem']}_best_loop.wav",
+    downloads[1].download_button(
+        "Download cleaned.wav",
+        result["artifacts"]["cleaned.wav"],
+        file_name=f"{result['stem']}_cleaned.wav",
         mime="audio/wav",
-        key=f"{result['stem']}_loop",
     )
-    dl_cols[4].download_button(
-        "diagnostic_plot.png",
+    downloads[2].download_button(
+        "Download quality report",
+        result["artifacts"]["recording_quality.json"],
+        file_name=f"{result['stem']}_recording_quality.json",
+        mime="application/json",
+    )
+    downloads[3].download_button(
+        "Download diagnostic plot",
         result["artifacts"]["diagnostic_plot.png"],
         file_name=f"{result['stem']}_diagnostic_plot.png",
         mime="image/png",
-        key=f"{result['stem']}_plot",
+    )
+    downloads[4].download_button(
+        "Download clean loop",
+        result["artifacts"]["cleanest_heartbeat_loop.wav"],
+        file_name=f"{result['stem']}_cleanest_heartbeat_loop.wav",
+        mime="audio/wav",
+    )
+    downloads[5].download_button(
+        "Download loud loop",
+        result["artifacts"]["cleanest_heartbeat_loop_loud.wav"],
+        file_name=f"{result['stem']}_cleanest_heartbeat_loop_loud.wav",
+        mime="audio/wav",
     )
 
-    with st.expander("View tempo summary JSON"):
+    with st.expander("Technical details"):
         st.json(summary)
-    with st.expander("Recording-quality reasons and loop candidates"):
-        st.json(recording_quality)
-        st.dataframe(result["loop_candidates"], width='stretch')
-        st.dataframe(result["template_analysis"], width='stretch')
-
-    with st.expander("Manual beat and loop correction"):
-        st.caption("Edit beat times in seconds, then optionally set an exact loop range. The exports will be regenerated.")
-        if "input_data" not in result or "params" not in result:
-            st.warning("This result was created before manual correction was available. Process the input again first.")
-            return None
-        revision = result.get("_ui_revision", 0)
-        key_prefix = f"{result['stem']}_{revision}"
-        edited_beats = st.data_editor(
-            pd.DataFrame({"time_seconds": result["beat_times"]}),
-            num_rows="dynamic",
-            width='stretch',
-            key=f"{key_prefix}_manual_beats",
-        )
-        loop_cols = st.columns(2)
-        manual_start = loop_cols[0].number_input(
-            "Manual loop start (seconds)",
-            min_value=0.0,
-            max_value=float(summary["duration_seconds"]),
-            value=float(loop["start_seconds"]),
-            step=0.01,
-            key=f"{key_prefix}_manual_loop_start",
-        )
-        manual_end = loop_cols[1].number_input(
-            "Manual loop end (seconds)",
-            min_value=0.0,
-            max_value=float(summary["duration_seconds"]),
-            value=float(loop["end_seconds"]),
-            step=0.01,
-            key=f"{key_prefix}_manual_loop_end",
-        )
-        action_cols = st.columns(2)
-        apply_changes = action_cols[0].button("Apply manual corrections", key=f"{key_prefix}_apply")
-        reset_changes = action_cols[1].button("Restore automatic analysis", key=f"{key_prefix}_reset")
-        if reset_changes:
-            updated = process_audio_bytes(result["name"], result["input_data"], params=result["params"])
-        elif apply_changes:
-            manual_times = pd.to_numeric(edited_beats["time_seconds"], errors="coerce").dropna().to_numpy()
-            updated = process_audio_bytes(
-                result["name"],
-                result["input_data"],
-                params=result["params"],
-                manual_beat_times=manual_times,
-                manual_loop_range=(float(manual_start), float(manual_end)),
-            )
-        else:
-            return None
-        updated["_ui_revision"] = revision + 1
-        if save_outputs:
-            output_root = Path("outputs") / "manual_corrections" / datetime.now().strftime("%Y%m%d_%H%M%S")
-            save_result_to_dir(updated, output_root)
-        return updated
-
-    return None
 
 
 def main() -> None:
-    st.title("LegaSynth Heartbeat Audio Analysis")
-    st.write("Stage 1: upload heartbeat WAV or MP3 files, then export all preprocessing parameters, beat data, loop audio, and diagnostics.")
+    st.title("Heartbeat WAV Denoiser")
+    st.write(
+        "Upload one approximately 15-second heartbeat WAV. The processor reduces persistent background noise "
+        "and non-repeating friction while preserving recurrent S1/S2 energy."
+    )
+    st.caption("This is an audio preprocessor, not a medical diagnostic system.")
 
     params = sidebar_params()
-    save_outputs = st.sidebar.checkbox("Also save outputs to D:\\Heartbeat\\outputs", value=True)
-
-    files = st.file_uploader(
-        "Upload heartbeat audio files",
-        type=["wav", "mp3"],
-        accept_multiple_files=True,
+    uploaded = st.file_uploader(
+        "Upload one heartbeat WAV",
+        type=["wav"],
+        accept_multiple_files=False,
+        help="Maximum 25 MB and 30 seconds. The web app processes the recording in memory.",
     )
-
-    if not files:
-        st.info("Drop WAV or MP3 heartbeat recordings here to begin. The app does not require a GPU.")
+    if uploaded is None:
+        st.info("A mono or stereo PCM WAV is accepted. Stereo input is converted to mono.")
         return
 
-    if st.button("Process uploaded files", type="primary"):
-        results = []
-        output_root = Path("outputs") / datetime.now().strftime("%Y%m%d_%H%M%S")
-        progress = st.progress(0)
-        for i, uploaded in enumerate(files):
-            try:
-                result = process_audio_bytes(uploaded.name, uploaded.getvalue(), params)
-                results.append(result)
-                if save_outputs:
-                    save_result_to_dir(result, output_root)
-            except Exception as exc:
-                st.error(f"Failed to process {uploaded.name}: {exc}")
-            progress.progress((i + 1) / len(files))
+    uploaded_bytes = uploaded.getvalue()
+    if len(uploaded_bytes) > MAX_UPLOAD_BYTES:
+        st.error("The WAV is larger than 25 MB. Please upload an approximately 15-second recording.")
+        return
 
-        if not results:
-            st.error("No files were processed successfully.")
+    if st.button("Denoise heartbeat", type="primary"):
+        try:
+            result = process_audio_bytes(
+                uploaded.name,
+                uploaded_bytes,
+                params,
+                max_duration_seconds=MAX_DURATION_SECONDS,
+            )
+            st.session_state["denoising_result"] = result
+            st.success("Processing complete. Results are available below and have not been saved on the server.")
+        except Exception as exc:
+            st.error(f"Failed to process the WAV: {exc}")
             return
 
-        st.session_state["results"] = results
-        if save_outputs:
-            st.success(f"Saved outputs to {output_root.resolve()}")
-
-    results = st.session_state.get("results", [])
-    if results:
-        st.download_button(
-            "Download all processed outputs as one zip",
-            make_batch_zip(results),
-            file_name="legasynth_heartbeat_batch_outputs.zip",
-            mime="application/zip",
-        )
-        for index, result in enumerate(results):
-            with st.expander(result["name"], expanded=len(results) == 1):
-                updated = render_result(result, save_outputs)
-                if updated is not None:
-                    results[index] = updated
-                    st.session_state["results"] = results
-                    st.rerun()
+    result = st.session_state.get("denoising_result")
+    if result is not None:
+        if st.button("Clear result from this session"):
+            del st.session_state["denoising_result"]
+            st.rerun()
+        render_result(result)
 
 
 if __name__ == "__main__":
