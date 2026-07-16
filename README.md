@@ -51,6 +51,17 @@ conda run --no-capture-output -n heartbeat python -m streamlit run app.py --serv
 
 也可以双击 `run_app.bat`。界面一次上传一条 WAV，并提供 Mild、Balanced、Strong 三个档位。默认先使用 Balanced；如果 S1/S2 被削薄，改用 Mild。
 
+网页版只在当前浏览器会话内存中处理音频，不会把上传的 WAV 或生成结果保存到服务器。单个文件最大 25 MB、最长 30 秒；处理结束后请直接下载 ZIP 或 WAV。命令行批处理仍会写入用户指定的本地输出目录。
+
+### Streamlit Community Cloud
+
+1. 在 Streamlit Community Cloud 中选择本仓库和要部署的分支。
+2. Entrypoint 选择根目录的 `app.py`。
+3. Python 版本选择 3.11。
+4. 部署完成后使用生成的 `*.streamlit.app` 地址访问。
+
+云端会读取 `environment.yml` 安装固定版本依赖，并读取 `.streamlit/config.toml` 限制上传大小。
+
 ## 命令行
 
 ```powershell

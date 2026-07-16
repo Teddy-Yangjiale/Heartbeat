@@ -3,12 +3,12 @@ channels:
   - defaults
 dependencies:
   - python=3.11
-  - numpy
-  - scipy
-  - pandas
-  - matplotlib
   - pip
   - pip:
-      - streamlit
-      - librosa
-      - soundfile
+      - streamlit==1.59.1
+      - numpy==2.4.6
+      - scipy==1.17.1
+      - pandas==3.0.3
+      - matplotlib==3.11.0
+      - librosa==0.11.0
+      - soundfile==0.14.0

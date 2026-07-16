@@ -100,11 +100,20 @@ def process_audio_bytes(
     data: bytes,
     params: ProcessingParams | None = None,
     manual_beat_times: np.ndarray | list[float] | None = None,
+    max_duration_seconds: float | None = None,
 ) -> dict[str, Any]:
     params = params or ProcessingParams()
     sr, raw, source_info = read_audio_bytes(filename, data)
     mono = to_mono_float(raw)
     duration = float(len(mono) / sr) if sr else 0.0
+    if max_duration_seconds is not None:
+        if max_duration_seconds <= 0:
+            raise ValueError("Maximum duration must be greater than zero.")
+        if duration > max_duration_seconds:
+            raise ValueError(
+                f"WAV duration is {duration:.1f} seconds; the maximum allowed duration is "
+                f"{max_duration_seconds:.0f} seconds."
+            )
 
     dc_removed = remove_dc(mono)
     peak = np.max(np.abs(dc_removed)) if len(dc_removed) else 0.0

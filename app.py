@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
-from pathlib import Path
-
 import streamlit as st
 
-from heartbeat_preprocessor.core import ProcessingParams, process_audio_bytes, save_result_to_dir
+from heartbeat_preprocessor.core import ProcessingParams, process_audio_bytes
+
+
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_DURATION_SECONDS = 30.0
 
 
 st.set_page_config(page_title="Heartbeat WAV Denoiser", layout="wide")
@@ -47,11 +48,12 @@ def sidebar_params() -> ProcessingParams:
         0.1,
         help="Changes export level only; it does not make the denoising more aggressive.",
     )
-    save_outputs = st.sidebar.checkbox("Save outputs locally", value=True)
     st.sidebar.caption(
         "The algorithm learns repetition only within this WAV. It attenuates inconsistent energy and never copies a heartbeat template into the output."
     )
-    st.session_state["save_outputs"] = save_outputs
+    st.sidebar.caption(
+        "Privacy: uploads and generated outputs stay in this browser session and are not saved by the web app."
+    )
     return ProcessingParams(export_peak_dbfs=export_peak_dbfs, **profiles[profile])
 
 
@@ -191,25 +193,40 @@ def main() -> None:
     st.caption("This is an audio preprocessor, not a medical diagnostic system.")
 
     params = sidebar_params()
-    uploaded = st.file_uploader("Upload one heartbeat WAV", type=["wav"], accept_multiple_files=False)
+    uploaded = st.file_uploader(
+        "Upload one heartbeat WAV",
+        type=["wav"],
+        accept_multiple_files=False,
+        help="Maximum 25 MB and 30 seconds. The web app processes the recording in memory.",
+    )
     if uploaded is None:
         st.info("A mono or stereo PCM WAV is accepted. Stereo input is converted to mono.")
         return
 
+    uploaded_bytes = uploaded.getvalue()
+    if len(uploaded_bytes) > MAX_UPLOAD_BYTES:
+        st.error("The WAV is larger than 25 MB. Please upload an approximately 15-second recording.")
+        return
+
     if st.button("Denoise heartbeat", type="primary"):
         try:
-            result = process_audio_bytes(uploaded.name, uploaded.getvalue(), params)
-            if st.session_state.get("save_outputs", True):
-                output_root = Path("outputs") / "denoising" / datetime.now().strftime("%Y%m%d_%H%M%S")
-                saved = save_result_to_dir(result, output_root)
-                st.success(f"Saved outputs to {saved}")
+            result = process_audio_bytes(
+                uploaded.name,
+                uploaded_bytes,
+                params,
+                max_duration_seconds=MAX_DURATION_SECONDS,
+            )
             st.session_state["denoising_result"] = result
+            st.success("Processing complete. Results are available below and have not been saved on the server.")
         except Exception as exc:
             st.error(f"Failed to process the WAV: {exc}")
             return
 
     result = st.session_state.get("denoising_result")
     if result is not None:
+        if st.button("Clear result from this session"):
+            del st.session_state["denoising_result"]
+            st.rerun()
         render_result(result)
 
 

@@ -36,6 +36,17 @@ def wav_data(sr: int, signal_data: np.ndarray) -> bytes:
 
 
 class HeartbeatDenoisingTest(unittest.TestCase):
+    def test_rejects_audio_over_configured_duration_limit(self) -> None:
+        sr = 8000
+        pcm = np.zeros(sr * 2, dtype=np.float32)
+
+        with self.assertRaisesRegex(ValueError, "maximum allowed duration is 1 seconds"):
+            process_audio_bytes(
+                "too_long.wav",
+                wav_data(sr, pcm),
+                max_duration_seconds=1.0,
+            )
+
     def test_reduces_sustained_voice_between_beats(self) -> None:
         sr = 8000
         seconds = 12
