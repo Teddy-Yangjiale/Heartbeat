@@ -2,12 +2,13 @@
 
 Heartbeat Music Processor 是一个完整的心跳驱动音乐处理网页。用户上传一段心跳 WAV 和一首 WAV/MP3 歌曲，系统会自动完成：
 
-1. 心跳降噪、节律检测、质量评估和真实连续周期选取；
-2. 歌曲 BPM、动态节拍网格、小节重拍和局部能量分析；
-3. 检测每个心跳周期真正的 S1 onset，并按局部速度和音乐角色排布；
+1. 自动工频抑制、心动静息相位噪声建模、节律检测、质量评估和多真实周期素材池；
+2. 歌曲 BPM、动态节拍网格、小节重拍、真实低频底鼓 onset 和局部能量分析；
+3. 检测每个心跳周期真正的 S1 onset，保留 S1/S2 有效段，并用可调吸附、微时差和 Swing 自然排布；
 4. 对指定时间区域单独调整歌曲音量、心跳音量、心跳密度和周期适配；
 5. 自动响度平衡、心跳触发的低频闪避、最终 LUFS 调整与峰值保护；
-6. 在线试听并导出最终音乐；独立轨、检查轨和工程 ZIP 可按需生成。
+6. 原声、电影感、Lo-fi、Trip-hop、极简电子、暗氛围预设；
+7. 在线试听并导出 FLAC、MP3、WAV16 或 WAV24；独立轨、检查轨和工程 ZIP 可按需生成。
 
 本程序不是医疗诊断工具。心跳质量判断只用于决定录音是否适合安全降噪和音乐制作。
 
@@ -35,7 +36,7 @@ conda env update -f environment.yml --prune
 ### 1. 上传输入
 
 - 心跳：PCM/浮点 WAV，建议约 15 秒，最大 25 MB、30 秒；单声道和立体声都可，预处理时会转成单声道。
-- 歌曲：WAV 或 MP3，最大 100 MB、5 分钟；解码后保留歌曲采样率和单/立体声结构，最终统一导出为 WAV。
+- 歌曲：WAV 或 MP3，最大 100 MB、5 分钟；解码后保留歌曲采样率和单/立体声结构。
 
 MP3 由 `soundfile` 随附的 `libsndfile` 直接解码，网页不依赖系统 FFmpeg。
 
@@ -57,19 +58,24 @@ MP3 由 `soundfile` 随附的 `libsndfile` 直接解码，网页不依赖系统 
 | 参数 | 作用 |
 |---|---|
 | 心跳节奏角色 | 音乐感知自动、小节重拍、底鼓角色、反拍、每拍及传统密度模式 |
-| 周期适配 | `gap` 保留自然心音；`stretch` 只在设置的最大倍率内拉伸 |
+| 音乐风格预设 | 同时设置心跳密度、律动松紧、音色、空间感和闪避；仍可逐项覆盖 |
+| 周期适配 | `preserve` 只保留 S1/S2 有效段并留白；`gap` 保留完整周期；`stretch` 受限拉伸 |
 | 每小节拍数 | 定义小节级排布和检查轨的重拍位置 |
 | 心跳出现范围 | 让心跳只在歌曲的某个整体范围内出现 |
 | 歌曲/心跳整体增益 | 在自动响度平衡结果上继续微调 |
 | 心跳相对响度 | 正值使心跳比歌曲活跃段更突出 |
 | 低频闪避 | 心跳出现时仅压低歌曲低频，为心音留出空间 |
 | 最终目标 LUFS | 控制母带目标响度 |
-| 输出峰值上限 | 防止最终 WAV 削波，默认 `-1 dBFS` |
+| 输出峰值上限 | 防止最终音频削波，默认 `-1 dBFS` |
 | 最低/最高心跳密度 | 限制自动调度的局部脉冲速度，避免过密或过疏 |
 | 听感偏移 | 在 S1 已准确落拍的基础上进行正负毫秒级人工微调 |
+| 节拍吸附强度 | 100% 紧贴歌曲网格；降低可保留心跳自身的自然呼吸感 |
+| 自然微时差 / Swing | 加入可复现的小幅 timing variation，避免机械重复 |
+| 存在感 / 饱和 / 空间感 | 在线安全的心跳音色与短空间塑形，不替换原始心音 |
 | 乐段动态强度 | 根据歌曲局部能量改变心跳响度，并在低能量段自动疏化 |
 | 心跳渐入/渐出 | 只控制心跳层的长包络，不改变歌曲本身 |
-| 最大拉伸倍率 | 限制心跳周期 time-stretch，默认 `1.18x` |
+| 最大拉伸倍率 | 仅限制手动选择 `stretch` 时的 time-stretch，默认 `1.10x` |
+| 最终文件格式 | 默认 MP3；另可选无损 FLAC16、WAV16 和制作母版 WAV24 |
 
 ### 4. 特定区域编辑
 
@@ -81,6 +87,7 @@ MP3 由 `soundfile` 随附的 `libsndfile` 直接解码，网页不依赖系统 
 - 独立心跳密度；
 - 独立周期适配方式；
 - 区域边界淡化时间。
+- 独立听感偏移和自然微时差。
 
 把某一区域的心跳密度设为 `mute`，可以制作只有歌曲、没有心跳的间奏。区域不能重叠，避免多套自动化同时修改同一位置。
 
@@ -97,7 +104,7 @@ MP3 由 `soundfile` 随附的 `libsndfile` 直接解码，网页不依赖系统 
 
 | 文件 | 含义 |
 |---|---|
-| `final_mix.wav` | 可交付的最终歌曲与心跳混音 |
+| `final_mix.mp3/.flac/.wav` | 按网页所选格式导出的最终歌曲与心跳混音；默认 MP3 |
 | `heartbeat_aligned.wav` | 可选：已对齐并经过最终母带增益的独立心跳轨 |
 | `song_processed.wav` | 可选：经过区域增益、低频闪避和母带增益的歌曲轨 |
 | `debug_click_mix.wav` | 可选：最终混音加节拍点击声，用于检查 BPM 和第一拍 |
@@ -106,22 +113,23 @@ MP3 由 `soundfile` 随附的 `libsndfile` 直接解码，网页不依赖系统 
 | `region_edits.json` | 可复查的区域编辑参数 |
 | `heartbeat_music_project.zip` | 上述全部工程文件 |
 
-心跳预处理阶段始终使用 `cleanest_heartbeat_loop.wav` 进入混音，不使用仅供手机试听的 `cleanest_heartbeat_loop_loud.wav`，避免重复增益和软削波。
+心跳预处理阶段优先使用 `cycle_pool` 中最多 16 个真实周期进入混音；若旧结果没有素材池才回退到 `cleanest_heartbeat_loop.wav`。不会使用仅供手机试听的增响版本，避免重复增益和软削波。
 
 ## 处理架构
 
 ```text
 heartbeat.wav
   -> process_audio_bytes()
-  -> attenuation-only denoising
+  -> hum notch + phase-aware attenuation-only denoising
   -> quality gate
-  -> cleanest real consecutive cycles -> per-cycle S1 onset anchors
+  -> quality-ranked real cycle pool -> per-cycle S1 onset anchors
+                                      -> preserve S1/S2 active audio
                                       -> local adaptive pulse schedule
 song.wav / song.mp3 -> beat/downbeat/energy grid -> region automation
                                       -> loudness balance
                                       -> low-band ducking
                                       -> master gain + peak protection
-                                      -> final_mix.wav
+                                      -> final_mix.flac/.mp3/.wav
 ```
 
 自动调度优先选择真实歌曲节拍，并根据心跳自然周期在局部改变密度。只有节拍模型出现长缺口时才插入报告中明确标记的 guide pulse，并在下一个真实节拍重新锁定。歌曲本身不会被整体 time-stretch；心跳周期只允许受限拉伸，S1 onset 在拉伸后会重新检测并落在目标时间。

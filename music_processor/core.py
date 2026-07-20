@@ -30,12 +30,15 @@ class RegionEdit:
     pulse_mode: str = "inherit"
     fit_mode: str = "inherit"
     fade_ms: float = 80.0
+    timing_offset_ms: float | None = None
+    humanize_ms: float | None = None
 
 
 @dataclass(frozen=True)
 class MixParams:
     pulse_mode: str = "auto"
-    fit_mode: str = "gap"
+    fit_mode: str = "preserve"
+    style_preset: str = "cinematic"
     beats_per_bar: int = 4
     heartbeat_start_seconds: float = 0.0
     heartbeat_end_seconds: float | None = None
@@ -43,18 +46,26 @@ class MixParams:
     heartbeat_gain_db: float = 0.0
     auto_balance: bool = True
     song_target_lufs: float = -18.0
-    heartbeat_relative_lu: float = 1.0
-    ducking_db: float = 2.5
-    ducking_cutoff_hz: float = 280.0
+    heartbeat_relative_lu: float = -3.0
+    ducking_db: float = 1.5
+    ducking_cutoff_hz: float = 240.0
     master_target_lufs: float = -16.0
     output_ceiling_dbfs: float = -1.0
     pulse_min_bpm: float = 55.0
     pulse_max_bpm: float = 110.0
     timing_offset_ms: float = 0.0
+    quantize_strength: float = 0.72
+    humanize_ms: float = 10.0
+    swing: float = 0.0
     section_adaptive_strength: float = 0.65
     heartbeat_fade_in_seconds: float = 4.0
     heartbeat_fade_out_seconds: float = 5.0
-    max_stretch_ratio: float = 1.18
+    max_stretch_ratio: float = 1.10
+    heartbeat_presence_db: float = 1.5
+    heartbeat_saturation: float = 0.12
+    heartbeat_reverb_mix: float = 0.10
+    heartbeat_reverb_decay_ms: float = 260.0
+    output_format: str = "wav24"
 
 
 @dataclass(frozen=True)
@@ -64,6 +75,7 @@ class HeartbeatCycle:
     active_samples: int
     source_cycle_index: int
     anchor_mode: str = "s1-onset"
+    quality_score: float = 0.0
 
 
 PULSE_MODES = {
@@ -78,7 +90,100 @@ PULSE_MODES = {
     "double",
     "mute",
 }
-FIT_MODES = {"gap", "stretch"}
+FIT_MODES = {"preserve", "gap", "stretch"}
+OUTPUT_FORMATS = {"wav24", "wav16", "flac16", "mp3"}
+
+
+STYLE_PRESETS: dict[str, dict[str, float | str]] = {
+    "faithful": {
+        "label": "Faithful / 原声保真",
+        "pulse_mode": "auto",
+        "fit_mode": "preserve",
+        "heartbeat_relative_lu": -5.0,
+        "ducking_db": 0.8,
+        "quantize_strength": 0.62,
+        "humanize_ms": 12.0,
+        "swing": 0.0,
+        "presence_db": 0.5,
+        "saturation": 0.03,
+        "reverb_mix": 0.04,
+        "reverb_decay_ms": 180.0,
+    },
+    "cinematic": {
+        "label": "Cinematic / 电影感",
+        "pulse_mode": "auto",
+        "fit_mode": "preserve",
+        "heartbeat_relative_lu": -3.0,
+        "ducking_db": 1.5,
+        "quantize_strength": 0.72,
+        "humanize_ms": 10.0,
+        "swing": 0.0,
+        "presence_db": 1.5,
+        "saturation": 0.12,
+        "reverb_mix": 0.10,
+        "reverb_decay_ms": 260.0,
+    },
+    "lofi": {
+        "label": "Lo-fi / 松弛",
+        "pulse_mode": "half",
+        "fit_mode": "preserve",
+        "heartbeat_relative_lu": -6.0,
+        "ducking_db": 0.6,
+        "quantize_strength": 0.48,
+        "humanize_ms": 18.0,
+        "swing": 0.12,
+        "presence_db": -1.0,
+        "saturation": 0.20,
+        "reverb_mix": 0.08,
+        "reverb_decay_ms": 220.0,
+    },
+    "trip_hop": {
+        "label": "Trip-hop / 重拍",
+        "pulse_mode": "kick",
+        "fit_mode": "preserve",
+        "heartbeat_relative_lu": -2.0,
+        "ducking_db": 2.0,
+        "quantize_strength": 0.76,
+        "humanize_ms": 14.0,
+        "swing": 0.18,
+        "presence_db": 2.0,
+        "saturation": 0.24,
+        "reverb_mix": 0.07,
+        "reverb_decay_ms": 170.0,
+    },
+    "minimal": {
+        "label": "Minimal electronic / 极简电子",
+        "pulse_mode": "kick",
+        "fit_mode": "preserve",
+        "heartbeat_relative_lu": -4.0,
+        "ducking_db": 1.2,
+        "quantize_strength": 0.88,
+        "humanize_ms": 5.0,
+        "swing": 0.04,
+        "presence_db": 1.0,
+        "saturation": 0.10,
+        "reverb_mix": 0.05,
+        "reverb_decay_ms": 140.0,
+    },
+    "dark_ambient": {
+        "label": "Dark ambient / 暗氛围",
+        "pulse_mode": "bar",
+        "fit_mode": "preserve",
+        "heartbeat_relative_lu": -4.5,
+        "ducking_db": 0.5,
+        "quantize_strength": 0.35,
+        "humanize_ms": 24.0,
+        "swing": 0.0,
+        "presence_db": -0.5,
+        "saturation": 0.08,
+        "reverb_mix": 0.22,
+        "reverb_decay_ms": 520.0,
+    },
+}
+
+
+def get_style_preset(name: str) -> dict[str, float | str]:
+    return dict(STYLE_PRESETS.get(name, STYLE_PRESETS["cinematic"]))
 
 
 def _rss_mb() -> float:
@@ -204,6 +309,12 @@ def analyze_song_bytes(
         onset,
         hop_length,
     )
+    kick_times, kick_confidence = _detect_kick_onsets(
+        analysis_audio,
+        analysis_rate,
+        beat_grid,
+        hop_length,
+    )
     downbeats, downbeat_confidence, downbeat_source = _infer_downbeats(
         beat_grid,
         beat_low_strength,
@@ -243,6 +354,8 @@ def analyze_song_bytes(
         "downbeat_times_seconds": downbeats.tolist(),
         "beat_energy": beat_energy.tolist(),
         "beat_low_strength": beat_low_strength.tolist(),
+        "kick_times_seconds": kick_times.tolist(),
+        "kick_detection_confidence": kick_confidence,
         "waveform_overview_times_seconds": overview_times.tolist(),
         "waveform_overview_values": overview_values.tolist(),
         "warnings": warnings,
@@ -266,6 +379,9 @@ def process_music_bytes(
     create_zip: bool | None = None,
 ) -> dict[str, Any]:
     params = params or MixParams()
+    if params.output_format not in OUTPUT_FORMATS:
+        raise ValueError(f"Unknown output format: {params.output_format}")
+    output_spec = audio_export_spec(params.output_format)
     memory_trace: dict[str, float] = {}
     _record_memory(memory_trace, "start")
     disk_output = Path(output_dir) if output_dir is not None else None
@@ -307,6 +423,7 @@ def process_music_bytes(
                 active_samples=int(round(cycle.active_samples * scale)),
                 source_cycle_index=cycle.source_cycle_index,
                 anchor_mode=cycle.anchor_mode,
+                quality_score=cycle.quality_score,
             )
             for cycle in cycles
         ]
@@ -318,6 +435,7 @@ def process_music_bytes(
     default_mode = params.pulse_mode
     downbeats = np.asarray(song_analysis.get("downbeat_times_seconds", []), dtype=np.float64)
     beat_energy = np.asarray(song_analysis.get("beat_energy", []), dtype=np.float32)
+    kick_times = np.asarray(song_analysis.get("kick_times_seconds", []), dtype=np.float64)
     active_duration = max(cycle.active_samples for cycle in cycles) / sample_rate
     schedule = build_region_schedule(
         beat_grid,
@@ -336,6 +454,10 @@ def process_music_bytes(
         pulse_max_bpm=params.pulse_max_bpm,
         timing_offset_seconds=params.timing_offset_ms / 1000.0,
         section_adaptive_strength=params.section_adaptive_strength,
+        kick_times=kick_times,
+        quantize_strength=params.quantize_strength,
+        humanize_ms=params.humanize_ms,
+        swing=params.swing,
     )
     heartbeat_raw, anchor_report = render_heartbeat_layer(
         cycles,
@@ -363,7 +485,14 @@ def process_music_bytes(
     heartbeat_raw *= heartbeat_automation[:, None]
     del song_automation, heartbeat_automation
     song_track = song
-    heartbeat_track = heartbeat_raw
+    heartbeat_track, character_report = apply_heartbeat_character(
+        heartbeat_raw,
+        sample_rate,
+        presence_db=params.heartbeat_presence_db,
+        saturation=params.heartbeat_saturation,
+        reverb_mix=params.heartbeat_reverb_mix,
+        reverb_decay_ms=params.heartbeat_reverb_decay_ms,
+    )
 
     song_stats_before = analyze_loudness(song_track, sample_rate)
     heartbeat_stats_before = analyze_loudness(heartbeat_track, sample_rate)
@@ -428,6 +557,7 @@ def process_music_bytes(
             "estimated_bpm": heartbeat_bpm,
             "selected_cycle_count": len(cycles),
             "source_artifact": "cleanest_heartbeat_loop.wav",
+            "cycle_source": "multi_cycle_pool" if heartbeat_result.get("cycle_pool") else "cleanest_loop",
         },
         "render": {
             "duration_seconds": duration,
@@ -449,7 +579,10 @@ def process_music_bytes(
             "maximum_anchor_alignment_error_ms": anchor_report["maximum_error_ms"],
             "skipped_anchor_count": anchor_report["skipped_count"],
             "regions": [asdict(edit) for edit in edits],
+            "style_preset": params.style_preset,
+            "groove_offset_ms": [float(item.get("groove_offset_ms", 0.0)) for item in schedule],
         },
+        "heartbeat_character": character_report,
         "ducking": duck_report,
         "master": master_report,
         "memory": {
@@ -457,6 +590,12 @@ def process_music_bytes(
             "peak_observed_mb": float(max(memory_trace.values(), default=0.0)),
         },
         "parameters": asdict(params),
+        "output": {
+            "filename": output_spec["filename"],
+            "format": params.output_format,
+            "mime": output_spec["mime"],
+            "bit_depth": output_spec["bit_depth"],
+        },
     }
     metadata_artifacts = {
         "mix_report.json": json.dumps(report, indent=2, ensure_ascii=False).encode("utf-8"),
@@ -465,7 +604,7 @@ def process_music_bytes(
             [asdict(edit) for edit in edits], indent=2, ensure_ascii=False
         ).encode("utf-8"),
     }
-    audio_artifacts: dict[str, np.ndarray] = {"final_mix.wav": mastered}
+    audio_artifacts: dict[str, np.ndarray] = {str(output_spec["filename"]): mastered}
     if export_stems:
         assert exported_heartbeat is not None and exported_song is not None
         audio_artifacts.update(
@@ -489,10 +628,13 @@ def process_music_bytes(
         "schedule": schedule,
     }
     if disk_output is None:
-        artifacts = {
-            **{name: wav_bytes(sample_rate, values) for name, values in audio_artifacts.items()},
-            **metadata_artifacts,
-        }
+        artifacts: dict[str, bytes] = {}
+        for name, values in audio_artifacts.items():
+            if name == output_spec["filename"]:
+                artifacts[name] = encode_audio_bytes(sample_rate, values, output_spec)
+            else:
+                artifacts[name] = encode_audio_bytes(sample_rate, values, audio_export_spec("wav16"))
+        artifacts.update(metadata_artifacts)
         result["artifacts"] = artifacts
         if create_zip:
             result["zip_bytes"] = make_zip(artifacts)
@@ -500,13 +642,8 @@ def process_music_bytes(
         artifact_paths: dict[str, str] = {}
         for name, values in audio_artifacts.items():
             path = disk_output / name
-            sf.write(
-                path,
-                np.asarray(values, dtype=np.float32).clip(-1.0, 1.0),
-                sample_rate,
-                format="WAV",
-                subtype="PCM_24",
-            )
+            spec = output_spec if name == output_spec["filename"] else audio_export_spec("wav16")
+            write_audio_file(path, sample_rate, values, spec)
             artifact_paths[name] = str(path)
         for name, values in metadata_artifacts.items():
             path = disk_output / name
@@ -605,6 +742,58 @@ def _beat_features(
         ).astype(np.float32)
 
     return robust_normalize(full), robust_normalize(low)
+
+
+def _detect_kick_onsets(
+    audio: np.ndarray,
+    sample_rate: int,
+    beats: np.ndarray,
+    hop_length: int,
+) -> tuple[np.ndarray, float]:
+    """Find low-frequency onsets near beats so the kick role follows the song."""
+    values = np.asarray(audio, dtype=np.float32)
+    beat_times = np.asarray(beats, dtype=np.float64)
+    if not len(values) or not len(beat_times):
+        return np.asarray([], dtype=np.float64), 0.0
+    low_onset = librosa.onset.onset_strength(
+        y=values,
+        sr=sample_rate,
+        hop_length=hop_length,
+        fmin=25.0,
+        fmax=min(180.0, sample_rate * 0.45),
+        n_mels=24,
+    )
+    if not len(low_onset) or float(np.max(low_onset)) <= 1e-9:
+        return np.asarray([], dtype=np.float64), 0.0
+    peak_frames = librosa.util.peak_pick(
+        low_onset,
+        pre_max=2,
+        post_max=2,
+        pre_avg=4,
+        post_avg=4,
+        delta=max(0.02, float(np.std(low_onset)) * 0.30),
+        wait=2,
+    )
+    peak_times = librosa.frames_to_time(
+        peak_frames,
+        sr=sample_rate,
+        hop_length=hop_length,
+    )
+    selected: list[float] = []
+    strengths: list[float] = []
+    reference = max(float(np.percentile(low_onset, 90.0)), 1e-9)
+    tolerance = 0.11
+    for beat in beat_times:
+        matches = np.flatnonzero(np.abs(peak_times - beat) <= tolerance)
+        if not len(matches):
+            continue
+        best = int(matches[np.argmax(low_onset[peak_frames[matches]])])
+        selected.append(float(peak_times[best]))
+        strengths.append(float(np.clip(low_onset[peak_frames[best]] / reference, 0.0, 1.0)))
+    if not selected:
+        return np.asarray([], dtype=np.float64), 0.0
+    confidence = float(np.clip(0.5 * len(selected) / len(beat_times) + 0.5 * np.median(strengths), 0.0, 1.0))
+    return np.unique(np.asarray(selected, dtype=np.float64)), confidence
 
 
 def _infer_downbeats(
@@ -732,6 +921,16 @@ def validate_region_edits(edits: list[RegionEdit], duration: float) -> list[Regi
                 pulse_mode=edit.pulse_mode,
                 fit_mode=edit.fit_mode,
                 fade_ms=float(np.clip(edit.fade_ms, 0.0, 5000.0)),
+                timing_offset_ms=(
+                    None
+                    if edit.timing_offset_ms is None
+                    else float(np.clip(edit.timing_offset_ms, -250.0, 250.0))
+                ),
+                humanize_ms=(
+                    None
+                    if edit.humanize_ms is None
+                    else float(np.clip(edit.humanize_ms, 0.0, 60.0))
+                ),
             )
         )
     normalized.sort(key=lambda item: (item.start_seconds, item.end_seconds))
@@ -808,6 +1007,7 @@ def build_adaptive_pulse_grid(
     pulse_min_bpm: float = 55.0,
     pulse_max_bpm: float = 110.0,
     active_duration_seconds: float = 0.0,
+    quantize_strength: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """Choose locally suitable real beats and bridge only unsupported long gaps."""
     values = np.unique(np.asarray(beats, dtype=np.float64))
@@ -820,6 +1020,7 @@ def build_adaptive_pulse_grid(
     maximum_interval = max(60.0 / slow_rate, minimum_interval)
     natural_interval = 60.0 / max(float(heartbeat_bpm), 1e-6)
     target_interval = float(np.clip(natural_interval, minimum_interval, maximum_interval))
+    quantize = float(np.clip(quantize_strength, 0.0, 1.0))
     anchors = np.asarray(downbeats if downbeats is not None else [], dtype=np.float64)
     anchor_index = int(np.argmin(np.abs(values - anchors[0]))) if len(anchors) else 0
     relaxations = 0
@@ -843,7 +1044,9 @@ def build_adaptive_pulse_grid(
             if len(valid):
                 choice = int(valid[np.argmin(np.abs(np.log(np.maximum(deltas[valid], 1e-9) / target_interval)))])
                 next_index = int(candidates[choice])
-                times.append(float(values[next_index]))
+                natural = float(times[-1] + direction * target_interval)
+                selected = float(values[next_index])
+                times.append(float(natural + quantize * (selected - natural)))
                 backed.append(True)
                 current = next_index
                 continue
@@ -881,12 +1084,16 @@ def _role_pulse_grid(
     downbeats: np.ndarray,
     mode: str,
     meter: int,
+    kick_times: np.ndarray | None = None,
 ) -> np.ndarray:
     values = np.asarray(beats, dtype=np.float64)
     if mode in {"normal", "every-beat", "double", "half", "bar", "mute"}:
         if mode == "bar" and len(downbeats):
             return np.asarray(downbeats, dtype=np.float64)
         return _pulse_grid(values, mode, meter)
+    detected_kicks = np.asarray(kick_times if kick_times is not None else [], dtype=np.float64)
+    if mode == "kick" and len(detected_kicks):
+        return detected_kicks
     anchors = np.asarray(downbeats, dtype=np.float64)
     anchor_index = int(np.argmin(np.abs(values - anchors[0]))) if len(anchors) else 0
     positions = (np.arange(len(values)) - anchor_index) % max(2, meter)
@@ -919,6 +1126,10 @@ def build_region_schedule(
     pulse_max_bpm: float = 110.0,
     timing_offset_seconds: float = 0.0,
     section_adaptive_strength: float = 0.0,
+    kick_times: np.ndarray | None = None,
+    quantize_strength: float = 1.0,
+    humanize_ms: float = 0.0,
+    swing: float = 0.0,
 ) -> list[dict[str, Any]]:
     start = max(0.0, float(heartbeat_start))
     end = min(duration, float(heartbeat_end) if heartbeat_end is not None else duration)
@@ -939,6 +1150,7 @@ def build_region_schedule(
         pulse_min_bpm=pulse_min_bpm,
         pulse_max_bpm=pulse_max_bpm,
         active_duration_seconds=active_duration_seconds,
+        quantize_strength=quantize_strength,
     )
     schedule: list[dict[str, Any]] = []
     for left, right in zip(points[:-1], points[1:]):
@@ -952,14 +1164,39 @@ def build_region_schedule(
         mode = active.pulse_mode if active and active.pulse_mode != "inherit" else default_mode
         fit = active.fit_mode if active and active.fit_mode != "inherit" else default_fit
         label = active.label if active else "Global"
+        local_offset = (
+            float(active.timing_offset_ms) / 1000.0
+            if active and active.timing_offset_ms is not None
+            else float(timing_offset_seconds)
+        )
+        local_humanize_ms = (
+            float(active.humanize_ms)
+            if active and active.humanize_ms is not None
+            else float(humanize_ms)
+        )
         if mode == "auto":
             pulse_values = adaptive_times
             model_values = adaptive_backed
         else:
-            pulse_values = _role_pulse_grid(beats, downbeat_values, mode, beats_per_bar)
+            pulse_values = _role_pulse_grid(
+                beats,
+                downbeat_values,
+                mode,
+                beats_per_bar,
+                kick_times=kick_times,
+            )
             model_values = np.ones(len(pulse_values), dtype=bool)
         for local_index, (pulse, model_backed) in enumerate(zip(pulse_values, model_values)):
-            pulse = float(pulse) + float(timing_offset_seconds)
+            target_pulse = float(pulse)
+            groove_offset = local_offset
+            if abs(float(swing)) > 1e-9 and local_index % 2 == 1:
+                local_period = 60.0 / max(float(heartbeat_bpm), 1e-6)
+                groove_offset += float(np.clip(swing, -0.45, 0.45)) * local_period * 0.25
+            if local_humanize_ms > 0:
+                # A deterministic quasi-random pattern keeps rerenders reproducible.
+                unit = math.sin((local_index + 1) * 12.9898 + left * 78.233)
+                groove_offset += unit * local_humanize_ms / 1000.0
+            pulse = target_pulse + groove_offset
             if left - 1e-7 <= pulse < right - 1e-7:
                 if len(energy_values) == len(beats):
                     nearest = int(np.argmin(np.abs(beats - pulse)))
@@ -985,6 +1222,8 @@ def build_region_schedule(
                     {
                         "pulse_index": 0,
                         "time_seconds": float(pulse),
+                        "target_time_seconds": target_pulse,
+                        "groove_offset_ms": float(groove_offset * 1000.0),
                         "pulse_mode": mode,
                         "fit_mode": fit,
                         "region": label,
@@ -1041,8 +1280,30 @@ def _active_cycle_samples(audio: np.ndarray, sample_rate: int, anchor: int) -> i
 
 
 def extract_heartbeat_cycles(result: dict[str, Any]) -> tuple[list[HeartbeatCycle], int]:
-    audio = np.asarray(result["cleanest_audio"], dtype=np.float32)
     sample_rate = int(result["sample_rate"])
+    pooled = result.get("cycle_pool") or []
+    pooled_cycles: list[HeartbeatCycle] = []
+    for fallback_index, item in enumerate(pooled):
+        values = np.asarray(item.get("audio", []), dtype=np.float32)
+        if values.ndim == 1:
+            values = values[:, None]
+        if values.ndim != 2 or len(values) < int(0.2 * sample_rate):
+            continue
+        cycle_audio = _edge_fade(values, sample_rate, 5.0)
+        anchor = _detect_s1_anchor(cycle_audio, sample_rate)
+        pooled_cycles.append(
+            HeartbeatCycle(
+                audio=cycle_audio,
+                anchor_offset_samples=anchor,
+                active_samples=_active_cycle_samples(cycle_audio, sample_rate, anchor),
+                source_cycle_index=int(item.get("source_cycle_index", fallback_index)),
+                quality_score=float(item.get("quality_score", 0.0)),
+            )
+        )
+    if pooled_cycles:
+        return pooled_cycles, sample_rate
+
+    audio = np.asarray(result["cleanest_audio"], dtype=np.float32)
     segment = result["cleanest_segment"]
     start = float(segment["adjusted_start_seconds"])
     end = float(segment["adjusted_end_seconds"])
@@ -1108,17 +1369,18 @@ def render_heartbeat_layer(
     fallback = float(np.median(intervals)) if len(intervals) else 60.0 / 75.0
     rendered_errors: list[float] = []
     skipped = 0
-    previous_cycle = -1
+    recent_cycles: list[int] = []
     for index, item in enumerate(schedule):
         interval = float(intervals[index]) if index < len(intervals) else fallback
         target_samples = max(1, int(round(interval * sample_rate)))
         costs = [
             abs(math.log(max(len(cycle.audio), 1) / target_samples))
-            + (0.08 if cycle_index == previous_cycle and len(cycles) > 1 else 0.0)
+            + (0.30 if cycle_index in recent_cycles and len(cycles) > 2 else 0.0)
+            - 0.0015 * float(cycle.quality_score)
             for cycle_index, cycle in enumerate(cycles)
         ]
         cycle_index = int(np.argmin(costs))
-        previous_cycle = cycle_index
+        recent_cycles = [*recent_cycles[-2:], cycle_index]
         cycle = cycles[cycle_index]
         cycle_audio = cycle.audio
         if cycle_audio.shape[1] == 1 and channels > 1:
@@ -1132,6 +1394,7 @@ def render_heartbeat_layer(
                 active_samples=cycle.active_samples,
                 source_cycle_index=cycle.source_cycle_index,
                 anchor_mode=cycle.anchor_mode,
+                quality_score=cycle.quality_score,
             ),
             target_samples,
             sample_rate,
@@ -1173,10 +1436,14 @@ def fit_cycle(
 ) -> tuple[np.ndarray, int]:
     audio = cycle.audio
     target_samples = max(1, int(target_samples))
-    if mode == "gap":
+    if mode in {"preserve", "gap"}:
         output = np.zeros((target_samples, audio.shape[1]), dtype=np.float32)
-        length = min(len(audio), target_samples)
+        source_length = cycle.active_samples if mode == "preserve" else len(audio)
+        length = min(source_length, target_samples)
         output[:length] = audio[:length]
+        if mode == "preserve" and length > 2:
+            fade = min(length // 3, max(2, int(round(0.025 * sample_rate))))
+            output[length - fade : length] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)[:, None]
         return output, min(cycle.anchor_offset_samples, target_samples - 1)
     if mode != "stretch":
         raise ValueError(f"Unknown cycle fit mode: {mode}")
@@ -1257,6 +1524,54 @@ def arrangement_fade_envelope(
     return envelope
 
 
+def apply_heartbeat_character(
+    audio: np.ndarray,
+    sample_rate: int,
+    *,
+    presence_db: float,
+    saturation: float,
+    reverb_mix: float,
+    reverb_decay_ms: float,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Apply lightweight, online-safe tone shaping without replacing the heartbeat."""
+    source = np.asarray(audio, dtype=np.float32)
+    output = source.copy()
+    if not output.size:
+        return output, {
+            "presence_db": float(presence_db),
+            "saturation": float(saturation),
+            "reverb_mix": float(reverb_mix),
+            "reverb_decay_ms": float(reverb_decay_ms),
+        }
+    high = min(220.0, sample_rate * 0.42)
+    if high > 50.0 and abs(float(presence_db)) > 1e-6:
+        sos = signal.butter(2, [45.0, high], btype="bandpass", fs=sample_rate, output="sos")
+        band = signal.sosfiltfilt(sos, output, axis=0).astype(np.float32)
+        output += band * (db_to_gain(presence_db) - 1.0)
+    amount = float(np.clip(saturation, 0.0, 1.0))
+    if amount > 1e-6:
+        drive = 1.0 + 3.5 * amount
+        shaped = np.tanh(output * drive).astype(np.float32) / drive
+        output = (1.0 - amount) * output + amount * shaped
+    wet = float(np.clip(reverb_mix, 0.0, 0.45))
+    decay_seconds = float(np.clip(reverb_decay_ms, 60.0, 1200.0)) / 1000.0
+    if wet > 1e-6:
+        reverberant = np.zeros_like(output)
+        for fraction, gain in ((0.19, 0.42), (0.43, 0.27), (0.73, 0.16), (1.0, 0.09)):
+            delay = max(1, int(round(decay_seconds * fraction * sample_rate)))
+            if delay < len(output):
+                reverberant[delay:] += output[:-delay] * gain
+        output = (1.0 - wet) * output + wet * reverberant
+    return output.astype(np.float32, copy=False), {
+        "presence_db": float(presence_db),
+        "presence_band_low_hz": 45.0,
+        "presence_band_high_hz": float(high),
+        "saturation": amount,
+        "reverb_mix": wet,
+        "reverb_decay_ms": float(reverb_decay_ms),
+    }
+
+
 def analyze_loudness(audio: np.ndarray, sample_rate: int) -> dict[str, float]:
     data = np.asarray(audio, dtype=np.float32)
     peak = float(np.max(np.abs(data))) if data.size else 0.0
@@ -1288,7 +1603,7 @@ def frequency_selective_duck(
     cutoff_hz: float,
 ) -> tuple[np.ndarray, dict[str, float]]:
     if depth_db <= 0 or not heartbeat.size or float(np.max(np.abs(heartbeat))) <= 1e-9:
-        return song, {"depth_db": 0.0, "cutoff_hz": float(cutoff_hz)}
+        return song, {"depth_db": 0.0, "low_hz": 35.0, "cutoff_hz": float(cutoff_hz)}
     trigger = np.abs(heartbeat[:, 0]).astype(np.float32, copy=True)
     for channel in range(1, heartbeat.shape[1]):
         np.maximum(trigger, np.abs(heartbeat[:, channel]), out=trigger)
@@ -1308,19 +1623,21 @@ def frequency_selective_duck(
     np.power(10.0, envelope, out=envelope)
     gain = envelope
     cutoff = float(np.clip(cutoff_hz, 40.0, sample_rate * 0.45))
-    sos = signal.butter(4, cutoff, btype="lowpass", fs=sample_rate, output="sos")
-    low = signal.sosfiltfilt(sos, song, axis=0).astype(np.float32)
-    song -= low
-    low *= gain[:, None]
-    song += low
+    low_hz = min(35.0, cutoff * 0.5)
+    sos = signal.butter(3, [low_hz, cutoff], btype="bandpass", fs=sample_rate, output="sos")
+    heart_band = signal.sosfiltfilt(sos, song, axis=0).astype(np.float32)
+    song -= heart_band
+    heart_band *= gain[:, None]
+    song += heart_band
     mean_active_duck = (
         float(-20.0 * np.log10(max(float(np.mean(gain[active_mask])), 1e-9)))
         if np.any(active_mask)
         else 0.0
     )
-    del low
+    del heart_band
     return song, {
         "depth_db": float(depth_db),
+        "low_hz": float(low_hz),
         "cutoff_hz": cutoff,
         "mean_active_duck_db": mean_active_duck,
     }
@@ -1400,16 +1717,75 @@ def db_to_gain(value_db: float) -> float:
     return float(10.0 ** (float(value_db) / 20.0))
 
 
-def wav_bytes(sample_rate: int, audio: np.ndarray) -> bytes:
+def audio_export_spec(output_format: str) -> dict[str, str | int | None]:
+    specs: dict[str, dict[str, str | int | None]] = {
+        "wav24": {
+            "filename": "final_mix.wav",
+            "format": "WAV",
+            "subtype": "PCM_24",
+            "mime": "audio/wav",
+            "bit_depth": 24,
+        },
+        "wav16": {
+            "filename": "final_mix.wav",
+            "format": "WAV",
+            "subtype": "PCM_16",
+            "mime": "audio/wav",
+            "bit_depth": 16,
+        },
+        "flac16": {
+            "filename": "final_mix.flac",
+            "format": "FLAC",
+            "subtype": "PCM_16",
+            "mime": "audio/flac",
+            "bit_depth": 16,
+        },
+        "mp3": {
+            "filename": "final_mix.mp3",
+            "format": "MP3",
+            "subtype": "MPEG_LAYER_III",
+            "mime": "audio/mpeg",
+            "bit_depth": None,
+        },
+    }
+    if output_format not in specs:
+        raise ValueError(f"Unknown output format: {output_format}")
+    return dict(specs[output_format])
+
+
+def encode_audio_bytes(
+    sample_rate: int,
+    audio: np.ndarray,
+    spec: dict[str, str | int | None],
+) -> bytes:
     buffer = io.BytesIO()
     sf.write(
         buffer,
         np.asarray(audio, dtype=np.float32).clip(-1.0, 1.0),
         sample_rate,
-        format="WAV",
-        subtype="PCM_24",
+        format=str(spec["format"]),
+        subtype=str(spec["subtype"]),
     )
     return buffer.getvalue()
+
+
+def write_audio_file(
+    path: str | Path,
+    sample_rate: int,
+    audio: np.ndarray,
+    spec: dict[str, str | int | None],
+) -> None:
+    sf.write(
+        path,
+        np.asarray(audio, dtype=np.float32).clip(-1.0, 1.0),
+        sample_rate,
+        format=str(spec["format"]),
+        subtype=str(spec["subtype"]),
+    )
+
+
+def wav_bytes(sample_rate: int, audio: np.ndarray) -> bytes:
+    return encode_audio_bytes(sample_rate, audio, audio_export_spec("wav24"))
 
 
 def make_zip(artifacts: dict[str, bytes]) -> bytes:

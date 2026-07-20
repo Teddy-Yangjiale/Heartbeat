@@ -36,7 +36,7 @@ def main() -> None:
             song_source,
             heartbeat,
             analysis,
-            MixParams(),
+            MixParams(output_format="mp3"),
             output_dir=output_dir,
             export_stems=False,
             export_debug=False,

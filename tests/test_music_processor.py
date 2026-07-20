@@ -21,6 +21,8 @@ from music_processor.core import (
     analyze_song_bytes,
     build_adaptive_pulse_grid,
     build_region_schedule,
+    fit_cycle,
+    get_style_preset,
     process_music_bytes,
     render_heartbeat_layer,
 )
@@ -197,6 +199,112 @@ class MusicProcessorTests(unittest.TestCase):
         times = np.asarray([item["time_seconds"] for item in schedule])
         self.assertGreater(np.sum((times >= 2.0) & (times < 4.0)), 4)
         self.assertFalse(np.any((times >= 5.0) & (times < 6.0)))
+
+    def test_preserve_mode_cuts_noisy_tail_without_stretching_s1_s2(self) -> None:
+        sample_rate = 8000
+        audio = np.zeros((int(0.8 * sample_rate), 1), dtype=np.float32)
+        audio[int(0.08 * sample_rate) : int(0.30 * sample_rate)] = 0.5
+        audio[int(0.45 * sample_rate) :] = 0.12
+        cycle = HeartbeatCycle(
+            audio=audio,
+            anchor_offset_samples=int(0.08 * sample_rate),
+            active_samples=int(0.34 * sample_rate),
+            source_cycle_index=0,
+        )
+        fitted, anchor = fit_cycle(cycle, int(1.1 * sample_rate), sample_rate, "preserve")
+        self.assertEqual(anchor, cycle.anchor_offset_samples)
+        np.testing.assert_allclose(
+            fitted[: int(0.30 * sample_rate)],
+            audio[: int(0.30 * sample_rate)],
+            atol=1e-7,
+        )
+        self.assertLess(float(np.max(np.abs(fitted[int(0.38 * sample_rate) :]))), 1e-7)
+
+    def test_groove_controls_and_detected_kick_role_are_applied(self) -> None:
+        beats = np.arange(0.0, 6.0, 0.5)
+        kicks = np.asarray([0.04, 1.02, 2.06, 3.01, 4.05, 5.02])
+        schedule = build_region_schedule(
+            beats,
+            6.0,
+            "kick",
+            "preserve",
+            4,
+            0.0,
+            None,
+            [],
+            kick_times=kicks,
+            humanize_ms=12.0,
+            swing=0.10,
+        )
+        targets = np.asarray([item["target_time_seconds"] for item in schedule])
+        offsets = np.asarray([item["groove_offset_ms"] for item in schedule])
+        np.testing.assert_allclose(targets, kicks, atol=1e-9)
+        self.assertTrue(np.any(np.abs(offsets) > 1.0))
+        self.assertLess(float(np.max(np.abs(offsets))), 50.0)
+
+    def test_style_presets_and_compact_exports_change_the_audio_contract(self) -> None:
+        cinematic = get_style_preset("cinematic")
+        lofi = get_style_preset("lofi")
+        self.assertNotEqual(cinematic["quantize_strength"], lofi["quantize_strength"])
+        self.assertNotEqual(cinematic["saturation"], lofi["saturation"])
+        analysis = analyze_song_bytes(
+            "song.wav",
+            self.song_bytes,
+            manual_bpm=120.0,
+            manual_first_beat=0.3,
+        )
+        wav_result = process_music_bytes(
+            "song.wav",
+            self.song_bytes,
+            self.heartbeat,
+            analysis,
+            MixParams(output_format="wav24"),
+            render_duration_seconds=4.0,
+            export_stems=False,
+            export_debug=False,
+            create_zip=False,
+        )
+        flac_result = process_music_bytes(
+            "song.wav",
+            self.song_bytes,
+            self.heartbeat,
+            analysis,
+            MixParams(output_format="flac16"),
+            render_duration_seconds=4.0,
+            export_stems=False,
+            export_debug=False,
+            create_zip=False,
+        )
+        mp3_result = process_music_bytes(
+            "song.wav",
+            self.song_bytes,
+            self.heartbeat,
+            analysis,
+            MixParams(output_format="mp3"),
+            render_duration_seconds=4.0,
+            export_stems=False,
+            export_debug=False,
+            create_zip=False,
+        )
+        self.assertIn("final_mix.flac", flac_result["artifacts"])
+        self.assertLess(
+            len(flac_result["artifacts"]["final_mix.flac"]),
+            len(wav_result["artifacts"]["final_mix.wav"]),
+        )
+        decoded, rate = sf.read(io.BytesIO(flac_result["artifacts"]["final_mix.flac"]), always_2d=True)
+        self.assertEqual(rate, 22050)
+        self.assertEqual(decoded.shape[1], 2)
+        self.assertIn("final_mix.mp3", mp3_result["artifacts"])
+        self.assertLess(
+            len(mp3_result["artifacts"]["final_mix.mp3"]),
+            len(wav_result["artifacts"]["final_mix.wav"]),
+        )
+        mp3_decoded, mp3_rate = sf.read(
+            io.BytesIO(mp3_result["artifacts"]["final_mix.mp3"]),
+            always_2d=True,
+        )
+        self.assertEqual(mp3_rate, 22050)
+        self.assertEqual(mp3_decoded.shape[1], 2)
 
     def test_missing_beat_repair_requires_local_onset_support(self) -> None:
         beats = np.asarray([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.5, 4.0, 4.5, 5.0])

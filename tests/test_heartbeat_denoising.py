@@ -2,6 +2,7 @@ import io
 import unittest
 
 import numpy as np
+from scipy import signal as sp_signal
 from scipy.io import wavfile
 
 from heartbeat_preprocessor.core import (
@@ -10,7 +11,9 @@ from heartbeat_preprocessor.core import (
     cycle_consistency_denoise,
     measure_focal_cycle_contamination,
     measure_rhythm_preservation,
+    phase_aware_noise_reduction,
     process_audio_bytes,
+    suppress_detected_hum,
 )
 
 
@@ -36,6 +39,64 @@ def wav_data(sr: int, signal_data: np.ndarray) -> bytes:
 
 
 class HeartbeatDenoisingTest(unittest.TestCase):
+    def test_detected_mains_hum_is_notched_without_erasing_heart_events(self) -> None:
+        sr = 8000
+        seconds = 12
+        time = np.arange(sr * seconds, dtype=np.float32) / sr
+        beats = np.arange(0.8, seconds - 0.5, 0.8)
+        heart = 0.55 * heartbeat_signal(sr, seconds, beats)
+        contaminated = heart + 0.20 * np.sin(2.0 * np.pi * 50.0 * time)
+        output, report = suppress_detected_hum(contaminated, sr, ProcessingParams())
+
+        frequencies, before = sp_signal.welch(contaminated, fs=sr, nperseg=8192)
+        _, after = sp_signal.welch(output, fs=sr, nperseg=8192)
+        hum_bin = int(np.argmin(np.abs(frequencies - 50.0)))
+        reduction_db = 10.0 * np.log10((after[hum_bin] + 1e-18) / (before[hum_bin] + 1e-18))
+        heart_mask = np.abs(heart) > 0.03
+        correlation = float(np.corrcoef(heart[heart_mask], output[heart_mask])[0, 1])
+
+        self.assertTrue(report["applied"])
+        self.assertIn(50.0, report["detected_frequencies_hz"])
+        self.assertLess(reduction_db, -12.0)
+        self.assertGreater(correlation, 0.70)
+
+    def test_phase_noise_model_reduces_diastolic_floor_and_builds_cycle_pool(self) -> None:
+        sr = 8000
+        seconds = 15
+        time = np.arange(sr * seconds, dtype=np.float32) / sr
+        beats = np.arange(0.8, seconds - 0.5, 0.8)
+        rng = np.random.default_rng(31)
+        heart = 0.62 * heartbeat_signal(sr, seconds, beats, seed=32)
+        contaminated = heart + rng.normal(0.0, 0.035, len(time)).astype(np.float32)
+        reduced, report = phase_aware_noise_reduction(
+            contaminated,
+            sr,
+            beats,
+            ProcessingParams(),
+        )
+        phase = ((time - beats[0]) % 0.8) / 0.8
+        quiet = (time >= beats[0]) & (time <= beats[-1]) & (phase >= 0.55) & (phase <= 0.85)
+        heart_mask = np.abs(heart) > 0.03
+
+        def rms(values: np.ndarray, mask: np.ndarray) -> float:
+            return float(np.sqrt(np.mean(np.square(values[mask]))))
+
+        quiet_change_db = 20.0 * np.log10((rms(reduced, quiet) + 1e-12) / (rms(contaminated, quiet) + 1e-12))
+        heart_change_db = 20.0 * np.log10((rms(reduced, heart_mask) + 1e-12) / (rms(contaminated, heart_mask) + 1e-12))
+        result = process_audio_bytes(
+            "pool.wav",
+            wav_data(sr, contaminated),
+            manual_beat_times=beats,
+            artifact_profile="web",
+            create_zip=False,
+        )
+
+        self.assertTrue(report["applied"])
+        self.assertLess(quiet_change_db, -2.0)
+        self.assertGreater(heart_change_db, quiet_change_db + 1.0)
+        self.assertGreater(len(result["cycle_pool"]), 4)
+        self.assertIn("heartbeat_cycle_pool_preview.wav", result["artifacts"])
+
     def test_rejects_audio_over_configured_duration_limit(self) -> None:
         sr = 8000
         pcm = np.zeros(sr * 2, dtype=np.float32)

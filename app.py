@@ -15,7 +15,14 @@ import pandas as pd
 import streamlit as st
 
 from heartbeat_preprocessor.core import ProcessingParams, process_audio_bytes
-from music_processor.core import MixParams, RegionEdit, analyze_song_bytes, process_music_bytes
+from music_processor.core import (
+    STYLE_PRESETS,
+    MixParams,
+    RegionEdit,
+    analyze_song_bytes,
+    get_style_preset,
+    process_music_bytes,
+)
 
 
 MAX_HEARTBEAT_BYTES = 25 * 1024 * 1024
@@ -41,7 +48,8 @@ PULSE_LABELS = {
     "inherit": "继承全局设置",
 }
 FIT_LABELS = {
-    "gap": "自然周期（推荐）",
+    "preserve": "保留 S1/S2、静息段留白（推荐）",
+    "gap": "保留完整原始周期",
     "stretch": "受限时间拉伸",
     "inherit": "继承全局设置",
 }
@@ -64,6 +72,7 @@ def compact_heartbeat_result(result: dict) -> dict:
         "input_reference.wav",
         "cleaned.wav",
         "cleanest_heartbeat_loop.wav",
+        "heartbeat_cycle_pool_preview.wav",
     }
     return {
         key: result[key]
@@ -75,6 +84,7 @@ def compact_heartbeat_result(result: dict) -> dict:
             "recording_quality",
             "cleanest_segment",
             "cleanest_audio",
+            "cycle_pool",
         )
     } | {
         "artifacts": {
@@ -123,18 +133,21 @@ def sidebar_denoising_params() -> ProcessingParams:
             "spectral_floor_db": -24.0,
             "cycle_outlier_attenuation_db": -12.0,
             "between_beat_attenuation_db": -18.0,
+            "phase_noise_reduction_strength": 0.65,
         },
         "Balanced": {
             "spectral_reduction_strength": 1.00,
             "spectral_floor_db": -30.0,
             "cycle_outlier_attenuation_db": -18.0,
             "between_beat_attenuation_db": -28.0,
+            "phase_noise_reduction_strength": 0.90,
         },
         "Strong": {
             "spectral_reduction_strength": 1.25,
             "spectral_floor_db": -36.0,
             "cycle_outlier_attenuation_db": -24.0,
             "between_beat_attenuation_db": -36.0,
+            "phase_noise_reduction_strength": 1.10,
         },
     }
     export_peak_dbfs = st.sidebar.slider(
@@ -145,10 +158,19 @@ def sidebar_denoising_params() -> ProcessingParams:
         0.1,
         help="只控制预处理文件的导出电平，不改变降噪强度。",
     )
+    enable_hum = st.sidebar.checkbox(
+        "自动抑制 50/60 Hz 工频嗡声",
+        value=True,
+        help="只有检测到持续、窄带且显著的工频峰时才启用陷波。",
+    )
     st.sidebar.caption(
         "预处理只衰减不一致能量，不会把模板复制或合成到心跳中。"
     )
-    return ProcessingParams(export_peak_dbfs=export_peak_dbfs, **profiles[profile])
+    return ProcessingParams(
+        export_peak_dbfs=export_peak_dbfs,
+        enable_hum_suppression=enable_hum,
+        **profiles[profile],
+    )
 
 
 def upload_signature(
@@ -182,6 +204,8 @@ def empty_region_table() -> pd.DataFrame:
             "心跳密度": pd.Series(dtype="str"),
             "周期适配": pd.Series(dtype="str"),
             "边界淡化(ms)": pd.Series(dtype="float"),
+            "听感偏移(ms)": pd.Series(dtype="float"),
+            "自然波动(ms)": pd.Series(dtype="float"),
         }
     )
 
@@ -208,6 +232,12 @@ def parse_region_table(frame: pd.DataFrame, duration: float) -> list[RegionEdit]
                 pulse_mode="inherit" if pd.isna(pulse) else str(pulse),
                 fit_mode="inherit" if pd.isna(fit) else str(fit),
                 fade_ms=80.0 if pd.isna(row.get("边界淡化(ms)")) else float(row["边界淡化(ms)"]),
+                timing_offset_ms=(
+                    None if pd.isna(row.get("听感偏移(ms)")) else float(row["听感偏移(ms)"])
+                ),
+                humanize_ms=(
+                    None if pd.isna(row.get("自然波动(ms)")) else float(row["自然波动(ms)"])
+                ),
             )
         )
     for edit in edits:
@@ -338,8 +368,12 @@ def show_analysis(heartbeat_result: dict, song_analysis: dict) -> None:
     left.audio(heartbeat_result["artifacts"]["input_reference.wav"], format="audio/wav")
     middle.write("预处理后心跳")
     middle.audio(heartbeat_result["artifacts"]["cleaned.wav"], format="audio/wav")
-    right.write("送入音乐处理器的真实连续周期")
-    right.audio(heartbeat_result["artifacts"]["cleanest_heartbeat_loop.wav"], format="audio/wav")
+    right.write("送入音乐处理器的多周期真实素材池")
+    pool_preview = heartbeat_result["artifacts"].get(
+        "heartbeat_cycle_pool_preview.wav",
+        heartbeat_result["artifacts"]["cleanest_heartbeat_loop.wav"],
+    )
+    right.audio(pool_preview, format="audio/wav")
 
 
 def render_outputs(result: dict) -> None:
@@ -369,9 +403,12 @@ def render_outputs(result: dict) -> None:
     def media(name: str):
         return paths.get(name, artifacts.get(name))
 
-    final_mix = media("final_mix.wav")
+    output_info = report.get("output", {})
+    final_name = str(output_info.get("filename", "final_mix.wav"))
+    final_mime = str(output_info.get("mime", "audio/wav"))
+    final_mix = media(final_name)
     st.write("最终混音")
-    st.audio(final_mix, format="audio/wav")
+    st.audio(final_mix, format=final_mime)
     available_tracks = [
         ("heartbeat_aligned.wav", "对齐后的独立心跳轨"),
         ("song_processed.wav", "处理后的歌曲轨"),
@@ -386,10 +423,10 @@ def render_outputs(result: dict) -> None:
 
     downloads = st.columns(4)
     downloads[0].download_button(
-        "下载最终音乐 WAV",
-        deferred_file(paths["final_mix.wav"]) if "final_mix.wav" in paths else final_mix,
-        file_name="final_heartbeat_music.wav",
-        mime="audio/wav",
+        "下载最终音乐",
+        deferred_file(paths[final_name]) if final_name in paths else final_mix,
+        file_name=f"final_heartbeat_music{Path(final_name).suffix}",
+        mime=final_mime,
         type="primary",
         on_click="ignore",
     )
@@ -509,6 +546,23 @@ def main() -> None:
             value=False,
             help="关闭时保留检测到的局部速度变化；指定 BPM 时会自动使用固定网格。",
         )
+    signature = hashlib.sha256(
+        (
+            signature
+            + "|"
+            + repr(denoising_params)
+            + "|"
+            + repr(
+                (
+                    manual_bpm,
+                    manual_first_beat,
+                    manual_first_downbeat,
+                    int(analysis_meter),
+                    bool(force_constant),
+                )
+            )
+        ).encode("utf-8")
+    ).hexdigest()
 
     if st.button("分析两路音频", type="primary", width="stretch"):
         try:
@@ -552,16 +606,36 @@ def main() -> None:
 
     st.header("3. 全局音乐处理参数")
     duration = float(song_analysis["duration_seconds"])
+    style_name = st.selectbox(
+        "音乐风格预设",
+        list(STYLE_PRESETS),
+        index=list(STYLE_PRESETS).index("cinematic"),
+        format_func=lambda name: str(STYLE_PRESETS[name]["label"]),
+        help="预设会同时改变心跳密度、律动松紧、音色、空间感与闪避强度，所有参数仍可手动覆盖。",
+    )
+    style = get_style_preset(style_name)
+    st.caption(
+        "推荐优先尝试电影配乐、Trip-hop、极简电子、Lo-fi 和暗氛围；"
+        "它们通常为低频心跳留出更稳定的频谱与编排空间。"
+    )
     row1 = st.columns(4)
+    pulse_options = ["auto", "downbeat", "kick", "backbeat", "every-beat", "bar", "half", "normal", "double"]
+    default_pulse = str(style["pulse_mode"])
     pulse_mode = row1[0].selectbox(
         "心跳节奏角色",
-        ["auto", "downbeat", "kick", "backbeat", "every-beat", "bar", "half", "normal", "double"],
+        pulse_options,
+        index=pulse_options.index(default_pulse),
         format_func=PULSE_LABELS.get,
+        key=f"pulse_mode_{style_name}",
     )
+    fit_options = ["preserve", "gap", "stretch"]
+    default_fit = str(style["fit_mode"])
     fit_mode = row1[1].selectbox(
         "周期适配方式",
-        ["gap", "stretch"],
+        fit_options,
+        index=fit_options.index(default_fit),
         format_func=FIT_LABELS.get,
+        key=f"fit_mode_{style_name}",
     )
     beats_per_bar = row1[2].number_input(
         "每小节拍数",
@@ -583,14 +657,18 @@ def main() -> None:
     heartbeat_gain_db = row2[1].slider("心跳整体增益 (dB)", -24.0, 24.0, 0.0, 0.5)
     auto_balance = row2[2].checkbox("自动响度平衡", value=True)
     heartbeat_relative_lu = row2[3].slider(
-        "心跳相对响度 (LU)", -12.0, 12.0, 1.0, 0.5,
+        "心跳相对响度 (LU)", -12.0, 12.0, float(style["heartbeat_relative_lu"]), 0.5,
         help="正值让心跳比歌曲活跃段更突出。",
+        key=f"heartbeat_relative_{style_name}",
     )
 
     with st.expander("高级混音与母带参数"):
         advanced = st.columns(5)
         song_target_lufs = advanced[0].slider("歌曲目标 LUFS", -24.0, -10.0, -18.0, 0.5)
-        ducking_db = advanced[1].slider("心跳触发低频闪避 (dB)", 0.0, 9.0, 2.5, 0.5)
+        ducking_db = advanced[1].slider(
+            "心跳触发低频闪避 (dB)", 0.0, 9.0, float(style["ducking_db"]), 0.1,
+            key=f"ducking_{style_name}",
+        )
         ducking_cutoff = advanced[2].slider("低频闪避截止 (Hz)", 80.0, 600.0, 280.0, 10.0)
         master_target = advanced[3].slider("最终目标 LUFS", -24.0, -10.0, -16.0, 0.5)
         ceiling = advanced[4].slider("输出峰值上限 (dBFS)", -6.0, -0.1, -1.0, 0.1)
@@ -601,7 +679,47 @@ def main() -> None:
         section_strength = alignment[3].slider("乐段动态强度", 0.0, 1.0, 0.65, 0.05)
         fade_in_seconds = alignment[4].slider("心跳渐入 (秒)", 0.0, 20.0, 4.0, 0.5)
         fade_out_seconds = alignment[5].slider("心跳渐出 (秒)", 0.0, 20.0, 5.0, 0.5)
-        max_stretch_ratio = alignment[6].slider("最大拉伸倍率", 1.02, 1.50, 1.18, 0.01)
+        max_stretch_ratio = alignment[6].slider("最大拉伸倍率", 1.02, 1.50, 1.10, 0.01)
+        groove = st.columns(7)
+        quantize_strength = groove[0].slider(
+            "节拍吸附强度", 0.0, 1.0, float(style["quantize_strength"]), 0.01,
+            key=f"quantize_{style_name}",
+            help="降低后会保留心跳自身的呼吸感，避免每次都钉死在网格上。",
+        )
+        humanize_ms = groove[1].slider(
+            "自然微时差(ms)", 0.0, 40.0, float(style["humanize_ms"]), 1.0,
+            key=f"humanize_{style_name}",
+        )
+        swing = groove[2].slider(
+            "Swing", -0.30, 0.30, float(style["swing"]), 0.01,
+            key=f"swing_{style_name}",
+        )
+        presence_db = groove[3].slider(
+            "心跳存在感(dB)", -6.0, 6.0, float(style["presence_db"]), 0.5,
+            key=f"presence_{style_name}",
+        )
+        saturation = groove[4].slider(
+            "心跳饱和度", 0.0, 1.0, float(style["saturation"]), 0.01,
+            key=f"saturation_{style_name}",
+        )
+        reverb_mix = groove[5].slider(
+            "心跳空间感", 0.0, 0.45, float(style["reverb_mix"]), 0.01,
+            key=f"reverb_{style_name}",
+        )
+        reverb_decay_ms = groove[6].slider(
+            "空间衰减(ms)", 60.0, 1200.0, float(style["reverb_decay_ms"]), 10.0,
+            key=f"decay_{style_name}",
+        )
+        output_format = st.selectbox(
+            "最终文件格式",
+            ["mp3", "flac16", "wav16", "wav24"],
+            format_func={
+                "mp3": "MP3（推荐：体积最小，方便分享）",
+                "flac16": "FLAC 16-bit（无损，通常比 WAV 小）",
+                "wav16": "WAV 16-bit（兼容性优先）",
+                "wav24": "WAV 24-bit（制作母版，体积最大）",
+            }.get,
+        )
         export_project_files = st.checkbox(
             "同时生成独立心跳轨、歌曲轨、点击检查轨和工程 ZIP",
             value=False,
@@ -641,10 +759,12 @@ def main() -> None:
                 default="inherit",
             ),
             "周期适配": st.column_config.SelectboxColumn(
-                options=["inherit", "gap", "stretch"],
+                options=["inherit", "preserve", "gap", "stretch"],
                 default="inherit",
             ),
             "边界淡化(ms)": st.column_config.NumberColumn(default=80.0, min_value=0.0, max_value=5000.0, step=10.0),
+            "听感偏移(ms)": st.column_config.NumberColumn(min_value=-250.0, max_value=250.0, step=1.0),
+            "自然波动(ms)": st.column_config.NumberColumn(min_value=0.0, max_value=60.0, step=1.0),
         },
         key="music_region_editor",
     )
@@ -663,6 +783,7 @@ def main() -> None:
         )
 
     mix_params = MixParams(
+        style_preset=style_name,
         pulse_mode=pulse_mode,
         fit_mode=fit_mode,
         beats_per_bar=int(beats_per_bar),
@@ -680,10 +801,18 @@ def main() -> None:
         pulse_min_bpm=float(pulse_min_bpm),
         pulse_max_bpm=float(max(pulse_min_bpm, pulse_max_bpm)),
         timing_offset_ms=float(timing_offset_ms),
+        quantize_strength=float(quantize_strength),
+        humanize_ms=float(humanize_ms),
+        swing=float(swing),
         section_adaptive_strength=float(section_strength),
         heartbeat_fade_in_seconds=float(fade_in_seconds),
         heartbeat_fade_out_seconds=float(fade_out_seconds),
         max_stretch_ratio=float(max_stretch_ratio),
+        heartbeat_presence_db=float(presence_db),
+        heartbeat_saturation=float(saturation),
+        heartbeat_reverb_mix=float(reverb_mix),
+        heartbeat_reverb_decay_ms=float(reverb_decay_ms),
+        output_format=str(output_format),
     )
 
     st.header("5. 试听或生成最终音乐")
