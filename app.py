@@ -260,7 +260,7 @@ def render_outputs(result: dict) -> None:
 def main() -> None:
     st.title("🎚️ Heartbeat Music Processor")
     st.write(
-        "上传一段心跳 WAV 和一首歌曲 WAV：网页会完成心跳预处理、歌曲节拍分析、"
+        "上传一段心跳 WAV 和一首 WAV/MP3 歌曲：网页会完成心跳预处理、歌曲节拍分析、"
         "心跳对齐、分段编辑、响度平衡和最终整首渲染。"
     )
     st.caption(
@@ -277,13 +277,13 @@ def main() -> None:
         help="建议约 15 秒；最大 25 MB、30 秒。",
     )
     song_upload = song_column.file_uploader(
-        "目标歌曲 WAV",
-        type=["wav"],
+        "目标歌曲 WAV / MP3",
+        type=["wav", "mp3"],
         accept_multiple_files=False,
-        help="最大 100 MB、5 分钟。保留原歌曲声道和采样率。",
+        help="支持 WAV 和 MP3；最大 100 MB、5 分钟。保留解码后的歌曲声道和采样率。",
     )
     if heartbeat_upload is None or song_upload is None:
-        st.info("请同时上传心跳 WAV 和歌曲 WAV。")
+        st.info("请同时上传心跳 WAV 和 WAV/MP3 歌曲。")
         return
 
     heartbeat_data = heartbeat_upload.getvalue()
@@ -292,7 +292,7 @@ def main() -> None:
         st.error("心跳 WAV 超过 25 MB。")
         return
     if len(song_data) > MAX_SONG_BYTES:
-        st.error("歌曲 WAV 超过 100 MB。")
+        st.error("歌曲文件超过 100 MB。")
         return
     signature = upload_signature(
         heartbeat_upload.name,

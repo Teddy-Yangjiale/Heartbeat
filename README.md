@@ -1,6 +1,6 @@
 # Heartbeat Music Processor
 
-Heartbeat Music Processor 是一个完整的心跳驱动音乐处理网页。用户上传一段心跳 WAV 和一首歌曲 WAV，系统会自动完成：
+Heartbeat Music Processor 是一个完整的心跳驱动音乐处理网页。用户上传一段心跳 WAV 和一首 WAV/MP3 歌曲，系统会自动完成：
 
 1. 心跳降噪、节律检测、质量评估和真实连续周期选取；
 2. 歌曲 BPM、第一拍和动态节拍网格分析；
@@ -35,9 +35,9 @@ conda env update -f environment.yml --prune
 ### 1. 上传输入
 
 - 心跳：PCM/浮点 WAV，建议约 15 秒，最大 25 MB、30 秒；单声道和立体声都可，预处理时会转成单声道。
-- 歌曲：WAV，最大 100 MB、5 分钟；最终渲染保留歌曲采样率和单/立体声结构。
+- 歌曲：WAV 或 MP3，最大 100 MB、5 分钟；解码后保留歌曲采样率和单/立体声结构，最终统一导出为 WAV。
 
-网页不依赖系统 FFmpeg，因此当前公开版不接受 MP3。需要处理 MP3 时请先在本地转换为 WAV。
+MP3 由 `soundfile` 随附的 `libsndfile` 直接解码，网页不依赖系统 FFmpeg。
 
 ### 2. 分析
 
@@ -111,7 +111,7 @@ heartbeat.wav
   -> quality gate
   -> cleanest real consecutive cycles
                                       -> pulse schedule
-song.wav -> librosa beat grid --------> region automation
+song.wav / song.mp3 -> librosa beat grid -> region automation
                                       -> loudness balance
                                       -> low-band ducking
                                       -> master gain + peak protection

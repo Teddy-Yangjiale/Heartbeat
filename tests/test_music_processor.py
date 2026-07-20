@@ -63,6 +63,13 @@ def synthetic_song(sample_rate: int = 22050, duration: float = 12.0) -> bytes:
     return wav_bytes(sample_rate, np.column_stack([mono, mono]))
 
 
+def mp3_bytes(wav_data: bytes) -> bytes:
+    audio, sample_rate = sf.read(io.BytesIO(wav_data), dtype="float32", always_2d=True)
+    buffer = io.BytesIO()
+    sf.write(buffer, audio, sample_rate, format="MP3", subtype="MPEG_LAYER_III")
+    return buffer.getvalue()
+
+
 class MusicProcessorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -84,6 +91,33 @@ class MusicProcessorTests(unittest.TestCase):
         self.assertEqual(analysis["grid_mode"], "constant_manual")
         self.assertAlmostEqual(grid[0], 0.3, places=5)
         np.testing.assert_allclose(np.diff(grid[:8]), 0.5, atol=1e-6)
+
+    def test_mp3_song_analysis_and_render(self) -> None:
+        encoded_song = mp3_bytes(self.song_bytes)
+        analysis = analyze_song_bytes(
+            "song.MP3",
+            encoded_song,
+            manual_bpm=120.0,
+            manual_first_beat=0.3,
+        )
+        self.assertEqual(analysis["source"]["format"], "mp3")
+        self.assertEqual(analysis["sample_rate"], 22050)
+        self.assertEqual(analysis["channels"], 2)
+
+        result = process_music_bytes(
+            "song.MP3",
+            encoded_song,
+            self.heartbeat,
+            analysis,
+            render_duration_seconds=2.0,
+        )
+        rendered_audio, rendered_rate = sf.read(
+            io.BytesIO(result["artifacts"]["final_mix.wav"]),
+            always_2d=True,
+        )
+        self.assertEqual(rendered_rate, 22050)
+        self.assertEqual(rendered_audio.shape[1], 2)
+        self.assertAlmostEqual(len(rendered_audio) / rendered_rate, 2.0, places=3)
 
     def test_region_schedule_changes_density_and_can_mute(self) -> None:
         beats = np.arange(0.0, 8.0, 0.5)

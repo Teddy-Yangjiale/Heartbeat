@@ -58,7 +58,7 @@ def analyze_song_bytes(
     manual_first_beat: float | None = None,
     force_constant_grid: bool = False,
 ) -> dict[str, Any]:
-    audio, sample_rate, source = read_wav_bytes(filename, data)
+    audio, sample_rate, source = read_song_bytes(filename, data)
     duration = len(audio) / sample_rate
     mono = np.mean(audio, axis=1, dtype=np.float64).astype(np.float32)
     analysis_rate = min(sample_rate, 22050)
@@ -182,7 +182,7 @@ def process_music_bytes(
 ) -> dict[str, Any]:
     params = params or MixParams()
     edits = validate_region_edits(region_edits or [], song_analysis["duration_seconds"])
-    song, sample_rate, _ = read_wav_bytes(song_filename, song_data)
+    song, sample_rate, _ = read_song_bytes(song_filename, song_data)
     full_duration = len(song) / sample_rate
     render_duration = (
         min(full_duration, max(1.0, float(render_duration_seconds)))
@@ -334,19 +334,21 @@ def process_music_bytes(
     }
 
 
-def read_wav_bytes(filename: str, data: bytes) -> tuple[np.ndarray, int, dict[str, Any]]:
-    if not filename.lower().endswith(".wav"):
-        raise ValueError("Only WAV input is supported by the web processor.")
+def read_song_bytes(filename: str, data: bytes) -> tuple[np.ndarray, int, dict[str, Any]]:
+    extension = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    if extension not in {"wav", "mp3"}:
+        raise ValueError("Song input must be a WAV or MP3 file.")
     try:
         audio, sample_rate = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
     except Exception as exc:
-        raise ValueError(f"Could not decode WAV: {exc}") from exc
+        raise ValueError(f"Could not decode {extension.upper()} song audio: {exc}") from exc
     if sample_rate <= 0 or not len(audio):
-        raise ValueError("The WAV is empty or has an invalid sample rate.")
+        raise ValueError("The song audio is empty or has an invalid sample rate.")
     if audio.shape[1] > 2:
         audio = audio[:, :2]
     return np.asarray(audio, dtype=np.float32), int(sample_rate), {
         "filename": filename,
+        "format": extension,
         "sample_rate": int(sample_rate),
         "channels": int(audio.shape[1]),
     }
