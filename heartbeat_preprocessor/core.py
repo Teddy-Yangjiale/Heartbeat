@@ -10,11 +10,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
-import matplotlib
-
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
 import librosa
 import numpy as np
 import pandas as pd
@@ -223,19 +218,6 @@ def process_audio_bytes(
     tempo_summary["cleanest_segment"] = cleanest_segment
 
     stem = safe_stem(filename)
-    envelope_df = make_envelope_frame(envelope, sr, params.export_envelope_hz)
-    beats_df = make_beats_frame(beat_times)
-    ibi_df = make_ibi_frame(beat_times)
-    window_analysis_df = pd.DataFrame(window_analysis)
-    template_analysis_df = pd.DataFrame(template_analysis)
-    segment_candidates_df = pd.DataFrame(segment_candidates)
-    template_waveform_df = pd.DataFrame(
-        {
-            "relative_time_seconds": np.arange(len(template_waveform), dtype=np.float32) / sr
-            - params.template_pre_ms / 1000.0,
-            "normalized_amplitude": template_waveform,
-        }
-    )
     if artifact_profile not in {"full", "web"}:
         raise ValueError("artifact_profile must be 'full' or 'web'.")
     preview_artifacts = {
@@ -245,6 +227,19 @@ def process_audio_bytes(
     }
     artifacts = dict(preview_artifacts)
     if artifact_profile == "full":
+        envelope_df = make_envelope_frame(envelope, sr, params.export_envelope_hz)
+        beats_df = make_beats_frame(beat_times)
+        ibi_df = make_ibi_frame(beat_times)
+        window_analysis_df = pd.DataFrame(window_analysis)
+        template_analysis_df = pd.DataFrame(template_analysis)
+        segment_candidates_df = pd.DataFrame(segment_candidates)
+        template_waveform_df = pd.DataFrame(
+            {
+                "relative_time_seconds": np.arange(len(template_waveform), dtype=np.float32) / sr
+                - params.template_pre_ms / 1000.0,
+                "normalized_amplitude": template_waveform,
+            }
+        )
         diagnostic_png = make_diagnostic_plot(
             stem=stem,
             raw=mono,
@@ -1917,6 +1912,11 @@ def make_diagnostic_plot(
     bpm_info: dict[str, float],
     template_analysis: list[dict[str, Any]],
 ) -> bytes:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     fig, axes = plt.subplots(5, 1, figsize=(12, 11), sharex=False)
     fig.suptitle(f"Heartbeat preprocessing diagnostics: {stem}")
     plot_signal(axes[0], raw, sr, "Raw mono waveform")
@@ -1946,7 +1946,7 @@ def make_diagnostic_plot(
     return buffer.getvalue()
 
 
-def plot_signal(ax: plt.Axes, x: np.ndarray, sr: int, title: str) -> None:
+def plot_signal(ax: Any, x: np.ndarray, sr: int, title: str) -> None:
     if not len(x):
         ax.set_title(title)
         return

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import logging
 import math
 import shutil
@@ -9,7 +10,6 @@ import threading
 import time
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -216,39 +216,98 @@ def parse_region_table(frame: pd.DataFrame, duration: float) -> list[RegionEdit]
     return edits
 
 
-def render_timeline(song_analysis: dict, edits: list[RegionEdit]) -> None:
+def build_timeline_svg(song_analysis: dict, edits: list[RegionEdit]) -> str:
     times = np.asarray(song_analysis["waveform_overview_times_seconds"], dtype=np.float64)
     waveform = np.asarray(song_analysis["waveform_overview_values"], dtype=np.float32)
-    figure, axis = plt.subplots(figsize=(15, 3.4))
-    axis.plot(times, waveform, color="#4063d8", linewidth=0.45, alpha=0.8)
-    beats = np.asarray(song_analysis["beat_grid_times_seconds"])
-    downbeats = np.asarray(song_analysis.get("downbeat_times_seconds", []))
-    for beat in beats:
-        is_downbeat = bool(len(downbeats) and np.min(np.abs(downbeats - beat)) < 0.04)
-        axis.axvline(
-            beat,
-            color="#f3a712" if is_downbeat else "#9aa5b1",
-            linewidth=0.8 if is_downbeat else 0.35,
-            alpha=0.55,
+    duration = max(float(song_analysis["duration_seconds"]), 1e-6)
+    width, height = 1200.0, 300.0
+    left, right, top, bottom = 58.0, 18.0, 22.0, 42.0
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+
+    max_points = 2400
+    if len(times) and len(waveform):
+        length = min(len(times), len(waveform))
+        step = max(1, int(math.ceil(length / max_points)))
+        sampled_times = times[:length:step]
+        sampled_waveform = waveform[:length:step]
+        peak = max(float(np.max(np.abs(sampled_waveform))), 1e-6)
+        points = " ".join(
+            f"{left + float(t) / duration * plot_width:.2f},"
+            f"{top + plot_height / 2.0 - float(value) / peak * plot_height * 0.46:.2f}"
+            for t, value in zip(sampled_times, sampled_waveform)
         )
+    else:
+        points = ""
+
+    beats = np.asarray(song_analysis["beat_grid_times_seconds"], dtype=np.float64)
+    downbeats = np.sort(
+        np.asarray(song_analysis.get("downbeat_times_seconds", []), dtype=np.float64)
+    )
+
+    def is_downbeat(beat: float) -> bool:
+        if not len(downbeats):
+            return False
+        index = int(np.searchsorted(downbeats, beat))
+        candidates = downbeats[max(0, index - 1) : min(len(downbeats), index + 1)]
+        return bool(len(candidates) and np.min(np.abs(candidates - beat)) < 0.04)
+
+    region_parts: list[str] = []
     colors = ["#ef476f", "#06d6a0", "#8338ec", "#ff7b00", "#118ab2"]
     for index, edit in enumerate(edits):
-        axis.axvspan(
-            edit.start_seconds,
-            edit.end_seconds,
-            color=colors[index % len(colors)],
-            alpha=0.18,
-            label=edit.label,
+        start_x = left + edit.start_seconds / duration * plot_width
+        end_x = left + edit.end_seconds / duration * plot_width
+        color = colors[index % len(colors)]
+        label = html.escape(edit.label)
+        region_parts.append(
+            f'<rect x="{start_x:.2f}" y="{top:.2f}" width="{max(0.0, end_x - start_x):.2f}" '
+            f'height="{plot_height:.2f}" fill="{color}" opacity="0.16"><title>{label}</title></rect>'
         )
-    axis.set_xlim(0, float(song_analysis["duration_seconds"]))
-    axis.set_xlabel("时间（秒）")
-    axis.set_ylabel("歌曲波形")
-    axis.set_title("歌曲时间线：橙色为推断/指定的小节重拍，灰色为普通节拍")
-    if edits:
-        axis.legend(loc="upper right", ncols=min(4, len(edits)))
-    figure.tight_layout()
-    st.pyplot(figure, width="stretch")
-    plt.close(figure)
+
+    beat_parts: list[str] = []
+    for beat in beats:
+        if beat < 0.0 or beat > duration:
+            continue
+        x = left + float(beat) / duration * plot_width
+        downbeat = is_downbeat(float(beat))
+        beat_parts.append(
+            f'<line x1="{x:.2f}" y1="{top:.2f}" x2="{x:.2f}" y2="{top + plot_height:.2f}" '
+            f'stroke="{"#f3a712" if downbeat else "#9aa5b1"}" '
+            f'stroke-width="{1.25 if downbeat else 0.55}" opacity="0.60" />'
+        )
+
+    tick_parts: list[str] = []
+    for index in range(7):
+        seconds = duration * index / 6.0
+        x = left + plot_width * index / 6.0
+        tick_parts.append(
+            f'<line x1="{x:.2f}" y1="{top + plot_height:.2f}" x2="{x:.2f}" '
+            f'y2="{top + plot_height + 5.0:.2f}" stroke="#6b7280" />'
+            f'<text x="{x:.2f}" y="{height - 14.0:.2f}" text-anchor="middle" '
+            f'font-size="12" fill="#6b7280">{seconds:.1f}s</text>'
+        )
+
+    return (
+        f'<svg viewBox="0 0 {width:.0f} {height:.0f}" width="100%" height="300" '
+        f'role="img" aria-label="歌曲时间线" xmlns="http://www.w3.org/2000/svg">'
+        '<style>text{font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}</style>'
+        f'<rect x="{left:.2f}" y="{top:.2f}" width="{plot_width:.2f}" height="{plot_height:.2f}" '
+        'fill="#f8fafc" stroke="#d1d5db" />'
+        + "".join(region_parts)
+        + "".join(beat_parts)
+        + f'<line x1="{left:.2f}" y1="{top + plot_height / 2.0:.2f}" '
+        f'x2="{left + plot_width:.2f}" y2="{top + plot_height / 2.0:.2f}" '
+        'stroke="#cbd5e1" stroke-width="0.6" />'
+        + (f'<polyline points="{points}" fill="none" stroke="#4063d8" stroke-width="1.0" opacity="0.88" />' if points else "")
+        + "".join(tick_parts)
+        + '<text x="600" y="15" text-anchor="middle" font-size="14" fill="#374151">'
+        '歌曲时间线：橙色为小节重拍，灰色为普通节拍，彩色区域为局部编辑</text>'
+        + '</svg>'
+    )
+
+
+def render_timeline(song_analysis: dict, edits: list[RegionEdit]) -> None:
+    st.html(build_timeline_svg(song_analysis, edits))
 
 
 def show_analysis(heartbeat_result: dict, song_analysis: dict) -> None:
