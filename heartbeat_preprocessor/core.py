@@ -8,7 +8,7 @@ import re
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import matplotlib
 
@@ -97,10 +97,12 @@ def process_wav_file(path: str | os.PathLike[str], params: ProcessingParams | No
 
 def process_audio_bytes(
     filename: str,
-    data: bytes,
+    data: bytes | memoryview | BinaryIO,
     params: ProcessingParams | None = None,
     manual_beat_times: np.ndarray | list[float] | None = None,
     max_duration_seconds: float | None = None,
+    artifact_profile: str = "full",
+    create_zip: bool = True,
 ) -> dict[str, Any]:
     params = params or ProcessingParams()
     sr, raw, source_info = read_audio_bytes(filename, data)
@@ -234,20 +236,28 @@ def process_audio_bytes(
             "normalized_amplitude": template_waveform,
         }
     )
-    diagnostic_png = make_diagnostic_plot(
-        stem=stem,
-        raw=mono,
-        filtered=filtered,
-        cleaned=cleaned,
-        envelope=envelope,
-        beat_times=beat_times,
-        sr=sr,
-        ibi=ibi,
-        bpm_info=bpm_info,
-        template_analysis=template_analysis,
-    )
-
-    artifacts = {
+    if artifact_profile not in {"full", "web"}:
+        raise ValueError("artifact_profile must be 'full' or 'web'.")
+    preview_artifacts = {
+        "input_reference.wav": wav_bytes(sr, input_reference_audio),
+        "cleaned.wav": wav_bytes(sr, cleaned_audio),
+        "cleanest_heartbeat_loop.wav": wav_bytes(sr, cleanest_audio),
+    }
+    artifacts = dict(preview_artifacts)
+    if artifact_profile == "full":
+        diagnostic_png = make_diagnostic_plot(
+            stem=stem,
+            raw=mono,
+            filtered=filtered,
+            cleaned=cleaned,
+            envelope=envelope,
+            beat_times=beat_times,
+            sr=sr,
+            ibi=ibi,
+            bpm_info=bpm_info,
+            template_analysis=template_analysis,
+        )
+        artifacts = {
         "tempo_summary.json": json.dumps(tempo_summary, indent=2).encode("utf-8"),
         "processing_parameters.json": json.dumps(asdict(params), indent=2).encode("utf-8"),
         "diagnostic_report.md": make_markdown_report(tempo_summary).encode("utf-8"),
@@ -268,14 +278,12 @@ def process_audio_bytes(
         ).to_csv(index=False).encode("utf-8"),
         "cleanest_segment.json": json.dumps(cleanest_segment, indent=2).encode("utf-8"),
         "cleanest_segment_candidates.csv": segment_candidates_df.to_csv(index=False).encode("utf-8"),
-        "input_reference.wav": wav_bytes(sr, input_reference_audio),
+        **preview_artifacts,
         "spectral_filtered.wav": wav_bytes(sr, spectral_filtered_audio),
-        "cleaned.wav": wav_bytes(sr, cleaned_audio),
         "filtered_detection.wav": wav_bytes(sr, filtered_audio),
-        "cleanest_heartbeat_loop.wav": wav_bytes(sr, cleanest_audio),
         "cleanest_heartbeat_loop_loud.wav": wav_bytes(sr, playback_audio),
         "diagnostic_plot.png": diagnostic_png,
-    }
+        }
 
     return {
         "name": filename,
@@ -302,7 +310,7 @@ def process_audio_bytes(
         "playback_audio": playback_audio,
         "segment_candidates": segment_candidates,
         "artifacts": artifacts,
-        "zip_bytes": make_zip_bytes(stem, artifacts),
+        "zip_bytes": make_zip_bytes(stem, artifacts) if create_zip else b"",
     }
 
 
@@ -368,7 +376,10 @@ def process_wav_bytes(
     return process_audio_bytes(filename, data, params=params)
 
 
-def read_audio_bytes(filename: str, data: bytes) -> tuple[int, np.ndarray, dict[str, Any]]:
+def read_audio_bytes(
+    filename: str,
+    data: bytes | memoryview | BinaryIO,
+) -> tuple[int, np.ndarray, dict[str, Any]]:
     suffix = Path(filename).suffix.lower()
     if suffix == ".wav":
         sr, raw, info = read_wav_bytes(data)
@@ -377,8 +388,17 @@ def read_audio_bytes(filename: str, data: bytes) -> tuple[int, np.ndarray, dict[
     raise ValueError(f"Unsupported heartbeat audio type: {suffix or '<none>'}. Use a WAV file.")
 
 
-def read_wav_bytes(data: bytes) -> tuple[int, np.ndarray, dict[str, Any]]:
-    sr, raw = wavfile.read(io.BytesIO(data))
+def read_wav_bytes(data: bytes | memoryview | BinaryIO) -> tuple[int, np.ndarray, dict[str, Any]]:
+    source_buffer = data if hasattr(data, "read") and hasattr(data, "seek") else io.BytesIO(data)
+    original_position = source_buffer.tell() if hasattr(source_buffer, "tell") else 0
+    try:
+        source_buffer.seek(0)
+        sr, raw = wavfile.read(source_buffer)
+    finally:
+        try:
+            source_buffer.seek(original_position)
+        except (AttributeError, OSError, ValueError):
+            pass
     info = {
         "sample_rate": int(sr),
         "dtype": str(raw.dtype),

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import json
+import tempfile
 import unittest
 import zipfile
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
@@ -11,12 +13,16 @@ from scipy.io import wavfile
 
 from heartbeat_preprocessor.core import process_audio_bytes
 from music_processor.core import (
+    HeartbeatCycle,
     MixParams,
     RegionEdit,
+    _detect_s1_anchor,
     _repair_missing_beats,
     analyze_song_bytes,
+    build_adaptive_pulse_grid,
     build_region_schedule,
     process_music_bytes,
+    render_heartbeat_layer,
 )
 
 
@@ -91,6 +97,68 @@ class MusicProcessorTests(unittest.TestCase):
         self.assertEqual(analysis["grid_mode"], "constant_manual")
         self.assertAlmostEqual(grid[0], 0.3, places=5)
         np.testing.assert_allclose(np.diff(grid[:8]), 0.5, atol=1e-6)
+        self.assertNotIn("audio", analysis)
+        self.assertLessEqual(len(analysis["waveform_overview_values"]), 10000)
+        self.assertGreater(len(analysis["downbeat_times_seconds"]), 1)
+
+    def test_song_file_like_input_is_reused_without_losing_position(self) -> None:
+        source = io.BytesIO(self.song_bytes)
+        source.seek(17)
+        analysis = analyze_song_bytes(
+            "song.wav",
+            source,
+            manual_bpm=120.0,
+            manual_first_beat=0.3,
+        )
+        self.assertEqual(source.tell(), 17)
+        self.assertEqual(analysis["channels"], 2)
+
+    def test_adaptive_grid_uses_real_beats_and_marks_only_gap_guides(self) -> None:
+        beats = np.concatenate([np.arange(0.0, 4.0, 0.5), np.arange(4.0, 8.0, 0.75)])
+        pulses, model_backed, relaxations = build_adaptive_pulse_grid(
+            beats,
+            75.0,
+            8.0,
+            downbeats=np.asarray([0.0, 2.0, 4.0, 7.0]),
+            active_duration_seconds=0.35,
+        )
+        self.assertGreater(len(pulses), 4)
+        self.assertTrue(np.all(model_backed))
+        self.assertEqual(relaxations, 0)
+        for pulse in pulses:
+            self.assertTrue(np.any(np.isclose(beats, pulse, atol=1e-9)))
+
+        gap_beats = np.asarray([0.0, 0.5, 1.0, 1.5, 5.0, 5.5, 6.0])
+        _, gap_model_backed, _ = build_adaptive_pulse_grid(
+            gap_beats,
+            75.0,
+            6.0,
+            active_duration_seconds=0.35,
+        )
+        self.assertTrue(np.any(~gap_model_backed))
+
+    def test_s1_anchor_is_rendered_at_the_requested_pulse(self) -> None:
+        sample_rate = 8000
+        audio = np.zeros((int(0.7 * sample_rate), 1), dtype=np.float32)
+        onset = int(0.08 * sample_rate)
+        local = np.arange(int(0.12 * sample_rate)) / sample_rate
+        audio[onset : onset + len(local), 0] = np.sin(2 * np.pi * 70 * local) * np.exp(-25 * local)
+        anchor = _detect_s1_anchor(audio, sample_rate)
+        self.assertGreater(anchor, int(0.03 * sample_rate))
+        cycle = HeartbeatCycle(audio, anchor, int(0.3 * sample_rate), 0)
+        schedule = [
+            {
+                "time_seconds": 1.0,
+                "fit_mode": "gap",
+                "velocity": 1.0,
+            }
+        ]
+        rendered, report = render_heartbeat_layer(
+            [cycle], schedule, sample_rate, 1, int(2.0 * sample_rate)
+        )
+        self.assertGreater(float(np.max(np.abs(rendered))), 0.1)
+        self.assertEqual(report["skipped_count"], 0)
+        self.assertLessEqual(report["maximum_error_ms"], 1e-6)
 
     def test_mp3_song_analysis_and_render(self) -> None:
         encoded_song = mp3_bytes(self.song_bytes)
@@ -181,6 +249,38 @@ class MusicProcessorTests(unittest.TestCase):
         with zipfile.ZipFile(io.BytesIO(result["zip_bytes"])) as archive:
             self.assertIn("final_mix.wav", archive.namelist())
             self.assertIn("heartbeat_timeline.csv", archive.namelist())
+
+    def test_disk_output_keeps_large_wav_bytes_out_of_result(self) -> None:
+        analysis = analyze_song_bytes(
+            "song.wav",
+            self.song_bytes,
+            manual_bpm=120.0,
+            manual_first_beat=0.3,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = process_music_bytes(
+                "song.wav",
+                self.song_bytes,
+                self.heartbeat,
+                analysis,
+                render_duration_seconds=2.0,
+                output_dir=directory,
+                export_stems=False,
+                export_debug=False,
+                create_zip=False,
+            )
+            self.assertNotIn("artifacts", result)
+            self.assertNotIn("zip_bytes", result)
+            self.assertEqual(
+                set(result["artifact_paths"]),
+                {
+                    "final_mix.wav",
+                    "mix_report.json",
+                    "heartbeat_timeline.csv",
+                    "region_edits.json",
+                },
+            )
+            self.assertTrue(Path(result["artifact_paths"]["final_mix.wav"]).is_file())
 
 
 if __name__ == "__main__":
