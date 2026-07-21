@@ -23,6 +23,12 @@ from music_processor.core import (
     get_style_preset,
     process_music_bytes,
 )
+from music_processor.sync_adapter import (
+    adapt_sync_result,
+    build_sync_command,
+    discover_sync_service,
+    run_sync_cli,
+)
 
 
 MAX_HEARTBEAT_BYTES = 25 * 1024 * 1024
@@ -73,6 +79,7 @@ def compact_heartbeat_result(result: dict) -> dict:
         "cleaned.wav",
         "cleanest_heartbeat_loop.wav",
         "heartbeat_cycle_pool_preview.wav",
+        "heartbeat_detection_mix.wav",
     }
     return {
         key: result[key]
@@ -85,6 +92,8 @@ def compact_heartbeat_result(result: dict) -> dict:
             "cleanest_segment",
             "cleanest_audio",
             "cycle_pool",
+            "s1_times",
+            "s2_times",
         )
     } | {
         "artifacts": {
@@ -353,6 +362,13 @@ def show_analysis(heartbeat_result: dict, song_analysis: dict) -> None:
         "重拍置信度",
         f"{song_analysis.get('downbeat_confidence', 0.0):.0%}",
     )
+    trim = song_analysis.get("content_trim", {})
+    if trim.get("enabled"):
+        st.caption(
+            f"歌曲内容裁剪：前端移除 {float(trim.get('removed_leading_seconds', 0.0)):.2f}s，"
+            f"尾端移除 {float(trim.get('removed_trailing_seconds', 0.0)):.2f}s；"
+            f"用于对齐的有效时长 {song_analysis['duration_seconds']:.2f}s。"
+        )
 
     if heartbeat_quality["needs_rerecording"]:
         st.error("心跳录音建议重新录制：" + " ".join(heartbeat_quality["rerecord_reasons"]))
@@ -363,7 +379,7 @@ def show_analysis(heartbeat_result: dict, song_analysis: dict) -> None:
     for warning in song_analysis["warnings"]:
         st.warning(warning)
 
-    left, middle, right = st.columns(3)
+    left, middle, right, diagnostic = st.columns(4)
     left.write("原始心跳")
     left.audio(heartbeat_result["artifacts"]["input_reference.wav"], format="audio/wav")
     middle.write("预处理后心跳")
@@ -374,6 +390,11 @@ def show_analysis(heartbeat_result: dict, song_analysis: dict) -> None:
         heartbeat_result["artifacts"]["cleanest_heartbeat_loop.wav"],
     )
     right.audio(pool_preview, format="audio/wav")
+    diagnostic.write("S1/S2 检测检查轨")
+    diagnostic.audio(
+        heartbeat_result["artifacts"]["heartbeat_detection_mix.wav"],
+        format="audio/wav",
+    )
 
 
 def render_outputs(result: dict) -> None:
@@ -394,8 +415,16 @@ def render_outputs(result: dict) -> None:
         f"声学锚点：{render_report.get('anchor_mode', 'unknown')} · "
         f"模型节拍 {render_report.get('model_backed_pulse_count', 0)} · "
         f"引导脉冲 {render_report.get('guide_pulse_count', 0)} · "
+        f"片头/片尾 {render_report.get('effective_intro_pulses', 0)}/"
+        f"{render_report.get('outro_pulses', 0)} · "
+        f"歌曲偏移 {render_report.get('song_offset_seconds', 0.0):.3f}s · "
         f"最大排程误差 {render_report.get('maximum_anchor_alignment_error_ms', 0.0):.3f} ms"
     )
+    warnings = result.get("sync_summary", {}).get(
+        "warnings", report.get("warnings", [])
+    )
+    for warning in list(dict.fromkeys(str(item) for item in warnings if item))[:6]:
+        st.warning(warning)
 
     paths = result.get("artifact_paths", {})
     artifacts = result.get("artifacts", {})
@@ -413,6 +442,7 @@ def render_outputs(result: dict) -> None:
         ("heartbeat_aligned.wav", "对齐后的独立心跳轨"),
         ("song_processed.wav", "处理后的歌曲轨"),
         ("debug_click_mix.wav", "节拍点击检查轨"),
+        ("heartbeat_detection_mix.wav", "S1/S2 心跳检测检查轨"),
     ]
     available_tracks = [(name, label) for name, label in available_tracks if media(name) is not None]
     if available_tracks:
@@ -441,13 +471,14 @@ def render_outputs(result: dict) -> None:
         disabled=heartbeat_stem is None,
         on_click="ignore",
     )
-    report_data = media("mix_report.json")
+    report_name = "analysis_report.json" if media("analysis_report.json") is not None else "mix_report.json"
+    report_data = media(report_name)
     downloads[2].download_button(
         "下载处理报告",
-        deferred_file(paths["mix_report.json"])
-        if "mix_report.json" in paths
+        deferred_file(paths[report_name])
+        if report_name in paths
         else report_data,
-        file_name="mix_report.json",
+        file_name=report_name,
         mime="application/json",
         on_click="ignore",
     )
@@ -466,6 +497,7 @@ def render_outputs(result: dict) -> None:
 
 def main() -> None:
     initialize_job_root()
+    sync_service = discover_sync_service()
     st.title("🎚️ Heartbeat Music Processor")
     st.write(
         "上传一段心跳 WAV 和一首 WAV/MP3 歌曲：网页会完成心跳预处理、歌曲节拍分析、"
@@ -546,6 +578,63 @@ def main() -> None:
             value=False,
             help="关闭时保留检测到的局部速度变化；指定 BPM 时会自动使用固定网格。",
         )
+    with st.expander("歌曲内容范围与 heartbeat_sync 后端", expanded=False):
+        trim_columns = st.columns(4)
+        trim_silence = trim_columns[0].checkbox(
+            "自动裁剪首尾静音",
+            value=True,
+            help="使用迁移文档规定的强/保守双阈值检测，避免把安静前奏误删。",
+        )
+        trim_top_db = trim_columns[1].slider(
+            "静音阈值 top-dB", 10.0, 60.0, 30.0, 1.0
+        )
+        with trim_columns[2]:
+            song_start_seconds = optional_number(
+                "手动歌曲起点（秒）",
+                "覆盖自动检测的歌曲内容起点",
+                0.0,
+                min_value=0.0,
+                step=0.01,
+            )
+        with trim_columns[3]:
+            song_end_seconds = optional_number(
+                "手动歌曲终点（秒）",
+                "覆盖自动检测的歌曲内容终点",
+                0.0,
+                min_value=0.0,
+                step=0.01,
+            )
+        engine_options = ["native"]
+        if sync_service is not None:
+            engine_options.append("heartbeat_sync_cli")
+        processing_engine = st.selectbox(
+            "渲染引擎",
+            engine_options,
+            format_func={
+                "native": "网页原生兼容引擎（支持分段编辑）",
+                "heartbeat_sync_cli": "官方 heartbeat_sync 黑盒 CLI（Beat This）",
+            }.get,
+        )
+        analysis_backend = st.selectbox(
+            "歌曲节拍分析后端",
+            ["auto", "librosa"] if processing_engine == "native" else ["auto", "beat-this", "librosa"],
+            help="auto 在官方 CLI 中优先 Beat This 并可回退；网页原生引擎使用 librosa。",
+        )
+        beat_device = st.selectbox(
+            "Beat This 设备",
+            ["auto", "cpu", "cuda"],
+            disabled=processing_engine == "native",
+        )
+        if sync_service is None:
+            st.caption(
+                "当前部署未配置 Windows heartbeat_sync 服务，因此使用 Linux 可运行的兼容引擎；"
+                "设置 HEARTBEAT_SYNC_REPO 后会自动出现官方 CLI 选项。"
+            )
+        elif processing_engine == "heartbeat_sync_cli":
+            st.warning(
+                "官方 CLI 严格按迁移合同运行，但不接受网页的分段风格编辑；"
+                "需要分段编辑时请选择网页原生兼容引擎。"
+            )
     signature = hashlib.sha256(
         (
             signature
@@ -559,6 +648,13 @@ def main() -> None:
                     manual_first_downbeat,
                     int(analysis_meter),
                     bool(force_constant),
+                    bool(trim_silence),
+                    float(trim_top_db),
+                    song_start_seconds,
+                    song_end_seconds,
+                    analysis_backend,
+                    processing_engine,
+                    beat_device,
                 )
             )
         ).encode("utf-8")
@@ -583,6 +679,11 @@ def main() -> None:
                     manual_first_downbeat=manual_first_downbeat,
                     manual_meter=int(analysis_meter),
                     force_constant_grid=force_constant,
+                    trim_silence=trim_silence,
+                    trim_top_db=float(trim_top_db),
+                    song_start_seconds=song_start_seconds,
+                    song_end_seconds=song_end_seconds,
+                    analysis_backend="librosa" if processing_engine == "heartbeat_sync_cli" else analysis_backend,
                     max_duration_seconds=MAX_SONG_DURATION_SECONDS,
                 )
                 cleanup_render_result(st.session_state.get("processor_render"))
@@ -710,6 +811,16 @@ def main() -> None:
             "空间衰减(ms)", 60.0, 1200.0, float(style["reverb_decay_ms"]), 10.0,
             key=f"decay_{style_name}",
         )
+        contract = st.columns(4)
+        beats_per_loop = contract[0].number_input(
+            "每个心跳循环包含周期数", 1, 16, 4, 1,
+            help="从质量最好的连续真实心跳周期中选取循环素材。",
+        )
+        intro_pulses = contract[1].number_input("歌曲前心跳次数", 0, 16, 4, 1)
+        outro_pulses = contract[2].number_input("歌曲后心跳次数", 0, 16, 4, 1)
+        intro_outro_boost_db = contract[3].slider(
+            "片头/片尾心跳增强 (dB)", 0.0, 12.0, 4.0, 0.5
+        )
         output_format = st.selectbox(
             "最终文件格式",
             ["mp3", "flac16", "wav16", "wav24"],
@@ -721,9 +832,12 @@ def main() -> None:
             }.get,
         )
         export_project_files = st.checkbox(
-            "同时生成独立心跳轨、歌曲轨、点击检查轨和工程 ZIP",
+            "生成 heartbeat_sync 五文件兼容包、歌曲轨和工程 ZIP",
             value=False,
-            help="会显著增加渲染时间和临时磁盘占用；默认只生成最终混音以保持网页稳定。",
+            help=(
+                "额外生成 24-bit preview_mix、heartbeat_aligned、debug_click_mix、"
+                "heartbeat_detection_mix 和 analysis_report；会增加渲染时间与临时磁盘占用。"
+            ),
         )
 
     st.header("4. 对特定时间段进行编辑")
@@ -787,6 +901,10 @@ def main() -> None:
         pulse_mode=pulse_mode,
         fit_mode=fit_mode,
         beats_per_bar=int(beats_per_bar),
+        beats_per_loop=int(beats_per_loop),
+        intro_pulses=int(intro_pulses),
+        outro_pulses=int(outro_pulses),
+        intro_outro_boost_db=float(intro_outro_boost_db),
         heartbeat_start_seconds=float(heartbeat_range[0]),
         heartbeat_end_seconds=float(heartbeat_range[1]),
         song_gain_db=float(song_gain_db),
@@ -813,6 +931,7 @@ def main() -> None:
         heartbeat_reverb_mix=float(reverb_mix),
         heartbeat_reverb_decay_ms=float(reverb_decay_ms),
         output_format=str(output_format),
+        sync_contract_exports=bool(export_project_files),
     )
 
     st.header("5. 试听或生成最终音乐")
@@ -844,19 +963,77 @@ def main() -> None:
                 label = "试听" if preview_clicked else "整首歌曲"
                 output_dir = tempfile.mkdtemp(prefix="job_", dir=initialize_job_root())
                 with st.spinner(f"正在渲染{label}……"):
-                    result = process_music_bytes(
-                        song_upload.name,
-                        song_upload,
-                        heartbeat_result,
-                        song_analysis,
-                        mix_params,
-                        region_edits,
-                        render_duration_seconds=preview_length if preview_clicked else None,
-                        output_dir=output_dir,
-                        export_stems=bool(export_project_files),
-                        export_debug=bool(export_project_files),
-                        create_zip=bool(export_project_files),
-                    )
+                    if processing_engine == "heartbeat_sync_cli":
+                        if sync_service is None:
+                            raise RuntimeError("heartbeat_sync CLI service is not configured")
+                        job_path = Path(output_dir)
+                        input_path = job_path / "inputs"
+                        input_path.mkdir(parents=True, exist_ok=True)
+                        heartbeat_path = input_path / "heartbeat_cleaned.wav"
+                        song_suffix = Path(song_upload.name).suffix.lower()
+                        if song_suffix not in {".wav", ".mp3"}:
+                            song_suffix = ".wav"
+                        song_path = input_path / f"song{song_suffix}"
+                        heartbeat_path.write_bytes(
+                            heartbeat_result["artifacts"]["cleaned.wav"]
+                        )
+                        song_path.write_bytes(bytes(song_data))
+                        sync_output_root = job_path / "heartbeat_sync_outputs"
+                        command = build_sync_command(
+                            sync_service,
+                            heartbeat_path=heartbeat_path,
+                            song_path=song_path,
+                            output_root=sync_output_root,
+                            song_analysis_backend=analysis_backend,
+                            beat_device=beat_device,
+                            manual_song_bpm=manual_bpm,
+                            manual_first_beat=manual_first_beat,
+                            trim_silence=bool(trim_silence),
+                            trim_top_db=float(trim_top_db),
+                            song_start_seconds=song_start_seconds,
+                            song_end_seconds=song_end_seconds,
+                            max_song_seconds=preview_length if preview_clicked else None,
+                            beats_per_loop=int(beats_per_loop),
+                            intro_pulses=int(intro_pulses),
+                            outro_pulses=int(outro_pulses),
+                            pulse_mode={
+                                "downbeat": "bar",
+                                "kick": "half",
+                                "backbeat": "half",
+                                "every-beat": "normal",
+                                "mute": "bar",
+                            }.get(pulse_mode, pulse_mode),
+                            pulse_min=float(pulse_min_bpm),
+                            pulse_max=float(max(pulse_min_bpm, pulse_max_bpm)),
+                            song_gain_db=float(song_gain_db),
+                            heartbeat_gain_db=float(heartbeat_gain_db),
+                            auto_loudness=bool(auto_balance),
+                            song_target_lufs=float(song_target_lufs),
+                            heartbeat_relative_lu=float(heartbeat_relative_lu),
+                            intro_outro_boost_db=float(intro_outro_boost_db),
+                            fit_mode=fit_mode,
+                        )
+                        result = adapt_sync_result(
+                            run_sync_cli(
+                                sync_service,
+                                command,
+                                output_root=sync_output_root,
+                            )
+                        )
+                    else:
+                        result = process_music_bytes(
+                            song_upload.name,
+                            song_upload,
+                            heartbeat_result,
+                            song_analysis,
+                            mix_params,
+                            region_edits,
+                            render_duration_seconds=preview_length if preview_clicked else None,
+                            output_dir=output_dir,
+                            export_stems=bool(export_project_files),
+                            export_debug=bool(export_project_files),
+                            create_zip=bool(export_project_files),
+                        )
                     result["job_id"] = Path(output_dir).name
                     cleanup_render_result(st.session_state.get("processor_render"))
                     st.session_state["processor_render"] = {

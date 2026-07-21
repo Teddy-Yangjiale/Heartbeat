@@ -25,6 +25,7 @@ from music_processor.core import (
     get_style_preset,
     process_music_bytes,
     render_heartbeat_layer,
+    trim_song_content,
 )
 
 
@@ -187,7 +188,13 @@ class MusicProcessorTests(unittest.TestCase):
         )
         self.assertEqual(rendered_rate, 22050)
         self.assertEqual(rendered_audio.shape[1], 2)
-        self.assertAlmostEqual(len(rendered_audio) / rendered_rate, 2.0, places=3)
+        self.assertAlmostEqual(result["song_duration_seconds"], 2.0, places=3)
+        self.assertGreater(result["duration_seconds"], result["song_duration_seconds"])
+        self.assertAlmostEqual(
+            len(rendered_audio) / rendered_rate,
+            result["duration_seconds"],
+            places=3,
+        )
 
     def test_region_schedule_changes_density_and_can_mute(self) -> None:
         beats = np.arange(0.0, 8.0, 0.5)
@@ -341,7 +348,8 @@ class MusicProcessorTests(unittest.TestCase):
             ],
             render_duration_seconds=8.0,
         )
-        self.assertAlmostEqual(result["duration_seconds"], 8.0, places=3)
+        self.assertAlmostEqual(result["song_duration_seconds"], 8.0, places=3)
+        self.assertGreater(result["duration_seconds"], result["song_duration_seconds"])
         self.assertIn("final_mix.wav", result["artifacts"])
         self.assertIn("heartbeat_aligned.wav", result["artifacts"])
         report = json.loads(result["artifacts"]["mix_report.json"])
@@ -353,7 +361,11 @@ class MusicProcessorTests(unittest.TestCase):
         )
         self.assertEqual(rendered_rate, 22050)
         self.assertEqual(rendered_audio.shape[1], 2)
-        self.assertAlmostEqual(len(rendered_audio) / rendered_rate, 8.0, places=3)
+        self.assertAlmostEqual(
+            len(rendered_audio) / rendered_rate,
+            result["duration_seconds"],
+            places=3,
+        )
         with zipfile.ZipFile(io.BytesIO(result["zip_bytes"])) as archive:
             self.assertIn("final_mix.wav", archive.namelist())
             self.assertIn("heartbeat_timeline.csv", archive.namelist())
@@ -389,6 +401,88 @@ class MusicProcessorTests(unittest.TestCase):
                 },
             )
             self.assertTrue(Path(result["artifact_paths"]["final_mix.wav"]).is_file())
+
+    def test_hybrid_content_trim_and_manual_overrides(self) -> None:
+        sample_rate = 8000
+        audio = np.zeros((5 * sample_rate, 1), dtype=np.float32)
+        time = np.arange(int(2.5 * sample_rate), dtype=np.float32) / sample_rate
+        audio[int(1.5 * sample_rate) : int(4.0 * sample_rate), 0] = (
+            0.2 * np.sin(2.0 * np.pi * 30.0 * time)
+        )
+        trimmed, report = trim_song_content(
+            audio,
+            sample_rate,
+            enabled=True,
+            top_db=30.0,
+            manual_start_seconds=None,
+            manual_end_seconds=None,
+        )
+        self.assertGreater(report["used_start_seconds"], 1.2)
+        self.assertLess(report["used_start_seconds"], 1.7)
+        self.assertGreater(len(trimmed), 2 * sample_rate)
+        manual, manual_report = trim_song_content(
+            audio,
+            sample_rate,
+            enabled=True,
+            top_db=30.0,
+            manual_start_seconds=1.0,
+            manual_end_seconds=4.5,
+        )
+        self.assertEqual(len(manual), int(3.5 * sample_rate))
+        self.assertAlmostEqual(manual_report["used_start_seconds"], 1.0)
+        self.assertAlmostEqual(manual_report["used_end_seconds"], 4.5)
+
+    def test_sync_contract_exports_five_pcm24_files_and_report_sections(self) -> None:
+        analysis = analyze_song_bytes(
+            "song.wav",
+            self.song_bytes,
+            manual_bpm=120.0,
+            manual_first_beat=0.3,
+        )
+        result = process_music_bytes(
+            "song.wav",
+            self.song_bytes,
+            self.heartbeat,
+            analysis,
+            MixParams(
+                intro_pulses=2,
+                outro_pulses=2,
+                sync_contract_exports=True,
+            ),
+            render_duration_seconds=4.0,
+            export_stems=False,
+            export_debug=False,
+            create_zip=False,
+        )
+        artifacts = result["artifacts"]
+        expected = {
+            "preview_mix.wav",
+            "heartbeat_aligned.wav",
+            "debug_click_mix.wav",
+            "heartbeat_detection_mix.wav",
+            "analysis_report.json",
+        }
+        self.assertTrue(expected.issubset(artifacts))
+        for filename in expected - {"analysis_report.json"}:
+            self.assertEqual(sf.info(io.BytesIO(artifacts[filename])).subtype, "PCM_24")
+        report = json.loads(artifacts["analysis_report.json"])
+        self.assertEqual(
+            set(report),
+            {
+                "run",
+                "inputs",
+                "audio",
+                "content_trim",
+                "song_analysis",
+                "heartbeat_analysis",
+                "arrangement",
+                "loudness_analysis",
+                "alignment",
+            },
+        )
+        self.assertEqual(report["arrangement"]["effective_intro_pulses"], 2)
+        self.assertEqual(report["arrangement"]["outro_pulses"], 2)
+        self.assertTrue(report["run"]["exports_enabled"])
 
 
 if __name__ == "__main__":

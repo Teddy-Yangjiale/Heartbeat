@@ -40,6 +40,10 @@ class MixParams:
     fit_mode: str = "preserve"
     style_preset: str = "cinematic"
     beats_per_bar: int = 4
+    beats_per_loop: int = 4
+    intro_pulses: int = 4
+    outro_pulses: int = 4
+    intro_outro_boost_db: float = 4.0
     heartbeat_start_seconds: float = 0.0
     heartbeat_end_seconds: float | None = None
     song_gain_db: float = 0.0
@@ -66,6 +70,7 @@ class MixParams:
     heartbeat_reverb_mix: float = 0.10
     heartbeat_reverb_decay_ms: float = 260.0
     output_format: str = "wav24"
+    sync_contract_exports: bool = False
 
 
 @dataclass(frozen=True)
@@ -92,6 +97,13 @@ PULSE_MODES = {
 }
 FIT_MODES = {"preserve", "gap", "stretch"}
 OUTPUT_FORMATS = {"wav24", "wav16", "flac16", "mp3"}
+SYNC_OUTPUT_FILES = {
+    "mix": "preview_mix.wav",
+    "heartbeat_stem": "heartbeat_aligned.wav",
+    "beat_check": "debug_click_mix.wav",
+    "heartbeat_check": "heartbeat_detection_mix.wav",
+    "report": "analysis_report.json",
+}
 
 
 STYLE_PRESETS: dict[str, dict[str, float | str]] = {
@@ -205,12 +217,26 @@ def analyze_song_bytes(
     manual_first_downbeat: float | None = None,
     manual_meter: int = 4,
     force_constant_grid: bool = False,
+    trim_silence: bool = True,
+    trim_top_db: float = 30.0,
+    song_start_seconds: float | None = None,
+    song_end_seconds: float | None = None,
+    analysis_backend: str = "auto",
     max_duration_seconds: float | None = None,
 ) -> dict[str, Any]:
     audio, sample_rate, source = read_song_bytes(
         filename,
         data,
         max_duration_seconds=max_duration_seconds,
+    )
+    original_duration = len(audio) / sample_rate
+    audio, content_trim = trim_song_content(
+        audio,
+        sample_rate,
+        enabled=trim_silence,
+        top_db=trim_top_db,
+        manual_start_seconds=song_start_seconds,
+        manual_end_seconds=song_end_seconds,
     )
     duration = len(audio) / sample_rate
     mono = np.mean(audio, axis=1, dtype=np.float64).astype(np.float32)
@@ -263,6 +289,17 @@ def analyze_song_bytes(
     )
     use_constant = bool(force_constant_grid or manual_bpm is not None)
     warnings: list[str] = []
+    if analysis_backend not in {"auto", "librosa", "beat-this"}:
+        raise ValueError(f"Unknown song analysis backend: {analysis_backend}")
+    if analysis_backend in {"auto", "beat-this"}:
+        message = (
+            "Beat This requires the external heartbeat_sync Windows service; "
+            "the native web engine used librosa."
+        )
+        if analysis_backend == "beat-this":
+            warnings.append(message)
+        elif analysis_backend == "auto":
+            warnings.append("Beat This service was not configured; used librosa fallback.")
     if inserted_beats:
         warnings.append(
             f"Inserted {inserted_beats} locally supported missing beat(s) into the dynamic grid."
@@ -335,8 +372,11 @@ def analyze_song_bytes(
         "sample_rate": int(sample_rate),
         "channels": int(audio.shape[1]),
         "duration_seconds": float(duration),
+        "original_duration_seconds": float(original_duration),
+        "content_trim": content_trim,
         "source": source,
         "backend": "librosa",
+        "backend_requested": analysis_backend,
         "grid_mode": grid_mode,
         "estimated_bpm": float(selected_bpm),
         "detected_bpm": float(detected_bpm),
@@ -390,9 +430,19 @@ def process_music_bytes(
     export_stems = (disk_output is None) if export_stems is None else bool(export_stems)
     export_debug = (disk_output is None) if export_debug is None else bool(export_debug)
     create_zip = (disk_output is None) if create_zip is None else bool(create_zip)
+    contract_exports = bool(params.sync_contract_exports)
+    need_stems = bool(export_stems or contract_exports)
+    need_debug = bool(export_debug or contract_exports)
     edits = validate_region_edits(region_edits or [], song_analysis["duration_seconds"])
     song, sample_rate, _ = read_song_bytes(song_filename, song_data)
     _record_memory(memory_trace, "song_decoded")
+    original_song_duration = len(song) / sample_rate
+    content_trim = dict(song_analysis.get("content_trim") or {})
+    trim_start = float(content_trim.get("used_start_seconds", 0.0))
+    trim_end = float(content_trim.get("used_end_seconds", original_song_duration))
+    trim_start_sample = int(np.clip(round(trim_start * sample_rate), 0, len(song)))
+    trim_end_sample = int(np.clip(round(trim_end * sample_rate), trim_start_sample, len(song)))
+    song = song[trim_start_sample:trim_end_sample]
     full_duration = len(song) / sample_rate
     render_duration = (
         min(full_duration, max(1.0, float(render_duration_seconds)))
@@ -402,6 +452,16 @@ def process_music_bytes(
     target_samples = min(len(song), int(round(render_duration * sample_rate)))
     song = song[:target_samples]
     duration = len(song) / sample_rate
+    content_trim.update(
+        {
+            "used_start_seconds": trim_start_sample / sample_rate,
+            "used_end_seconds": trim_end_sample / sample_rate,
+            "removed_leading_seconds": trim_start_sample / sample_rate,
+            "removed_trailing_seconds": original_song_duration - trim_end_sample / sample_rate,
+            "processed_source_end_seconds": trim_start_sample / sample_rate + duration,
+            "test_truncation_seconds": max(0.0, full_duration - duration),
+        }
+    )
     beat_grid = np.asarray(song_analysis["beat_grid_times_seconds"], dtype=np.float64)
     beat_grid = beat_grid[(beat_grid >= 0.0) & (beat_grid < duration + 1e-6)]
     if len(beat_grid) < 2:
@@ -413,7 +473,10 @@ def process_music_bytes(
     if len(beat_grid) < 2:
         raise ValueError("The song needs at least two usable beat positions.")
 
-    cycles, heartbeat_source_rate = extract_heartbeat_cycles(heartbeat_result)
+    cycles, heartbeat_source_rate = extract_heartbeat_cycles(
+        heartbeat_result,
+        requested_cycles=params.beats_per_loop,
+    )
     if heartbeat_source_rate != sample_rate:
         scale = sample_rate / heartbeat_source_rate
         cycles = [
@@ -437,7 +500,7 @@ def process_music_bytes(
     beat_energy = np.asarray(song_analysis.get("beat_energy", []), dtype=np.float32)
     kick_times = np.asarray(song_analysis.get("kick_times_seconds", []), dtype=np.float64)
     active_duration = max(cycle.active_samples for cycle in cycles) / sample_rate
-    schedule = build_region_schedule(
+    base_schedule = build_region_schedule(
         beat_grid,
         duration,
         default_mode,
@@ -459,23 +522,65 @@ def process_music_bytes(
         humanize_ms=params.humanize_ms,
         swing=params.swing,
     )
+    arrangement = add_intro_outro_arrangement(
+        base_schedule,
+        beat_grid,
+        downbeats,
+        duration,
+        intro_pulses=params.intro_pulses,
+        outro_pulses=params.outro_pulses,
+        heartbeat_bpm=heartbeat_bpm,
+        fit_mode=params.fit_mode,
+    )
+    schedule = arrangement["schedule"]
+    song_offset = float(arrangement["song_offset_seconds"])
+    last_pulse = max(
+        (float(item["time_seconds"]) for item in schedule),
+        default=song_offset + duration,
+    )
+    cycle_tail = max(len(cycle.audio) for cycle in cycles) / sample_rate
+    output_duration = max(
+        song_offset + duration,
+        last_pulse + cycle_tail + 0.05,
+    )
+    output_samples = int(np.ceil(output_duration * sample_rate))
     heartbeat_raw, anchor_report = render_heartbeat_layer(
         cycles,
         schedule,
         sample_rate,
         song.shape[1],
-        len(song),
+        output_samples,
         max_stretch_ratio=params.max_stretch_ratio,
     )
     _record_memory(memory_trace, "heartbeat_rendered")
 
     song_automation = region_gain_envelope(len(song), sample_rate, edits, "song_gain_db")
+    shifted_edits = [
+        RegionEdit(
+            start_seconds=edit.start_seconds + song_offset,
+            end_seconds=edit.end_seconds + song_offset,
+            label=edit.label,
+            song_gain_db=edit.song_gain_db,
+            heartbeat_gain_db=edit.heartbeat_gain_db,
+            pulse_mode=edit.pulse_mode,
+            fit_mode=edit.fit_mode,
+            fade_ms=edit.fade_ms,
+            timing_offset_ms=edit.timing_offset_ms,
+            humanize_ms=edit.humanize_ms,
+        )
+        for edit in edits
+    ]
     heartbeat_automation = region_gain_envelope(
-        len(song), sample_rate, edits, "heartbeat_gain_db"
-    )
-    heartbeat_automation *= arrangement_fade_envelope(
-        len(song),
+        output_samples,
         sample_rate,
+        shifted_edits,
+        "heartbeat_gain_db",
+    )
+    heartbeat_automation *= final_timeline_heartbeat_envelope(
+        output_samples,
+        sample_rate,
+        song_offset,
+        duration,
         params.heartbeat_start_seconds,
         params.heartbeat_end_seconds,
         params.heartbeat_fade_in_seconds,
@@ -484,7 +589,7 @@ def process_music_bytes(
     song *= song_automation[:, None]
     heartbeat_raw *= heartbeat_automation[:, None]
     del song_automation, heartbeat_automation
-    song_track = song
+    song_source = song
     heartbeat_track, character_report = apply_heartbeat_character(
         heartbeat_raw,
         sample_rate,
@@ -493,8 +598,9 @@ def process_music_bytes(
         reverb_mix=params.heartbeat_reverb_mix,
         reverb_decay_ms=params.heartbeat_reverb_decay_ms,
     )
+    del heartbeat_raw
 
-    song_stats_before = analyze_loudness(song_track, sample_rate)
+    song_stats_before = analyze_loudness(song_source, sample_rate)
     heartbeat_stats_before = analyze_loudness(heartbeat_track, sample_rate)
     song_gain_db = float(params.song_gain_db)
     heartbeat_gain_db = float(params.heartbeat_gain_db)
@@ -510,8 +616,24 @@ def process_music_bytes(
             )
     song_gain_db = float(np.clip(song_gain_db, -24.0, 18.0))
     heartbeat_gain_db = float(np.clip(heartbeat_gain_db, -24.0, 30.0))
-    song_track *= db_to_gain(song_gain_db)
+    song_source *= db_to_gain(song_gain_db)
     heartbeat_track *= db_to_gain(heartbeat_gain_db)
+    heartbeat_track *= intro_outro_boost_envelope(
+        output_samples,
+        sample_rate,
+        song_offset,
+        duration,
+        params.intro_outro_boost_db,
+    )[:, None]
+
+    song_track = np.zeros((output_samples, song_source.shape[1]), dtype=np.float32)
+    song_start_sample = int(round(song_offset * sample_rate))
+    song_finish_sample = min(output_samples, song_start_sample + len(song_source))
+    if song_finish_sample > song_start_sample:
+        song_track[song_start_sample:song_finish_sample] = song_source[
+            : song_finish_sample - song_start_sample
+        ]
+    del song, song_source
 
     ducked_song, duck_report = frequency_selective_duck(
         song_track,
@@ -520,9 +642,12 @@ def process_music_bytes(
         depth_db=params.ducking_db,
         cutoff_hz=params.ducking_cutoff_hz,
     )
-    stem_song_source = ducked_song.copy() if export_stems else None
+    stem_song_source = ducked_song.copy() if need_stems else None
+    debug_song_source = ducked_song.copy() if need_debug else None
     raw_mix = ducked_song
     raw_mix += heartbeat_track
+    if not need_stems:
+        del heartbeat_track
     mastered, master_report = master_mix(
         raw_mix,
         sample_rate,
@@ -532,7 +657,7 @@ def process_music_bytes(
     _record_memory(memory_trace, "mix_mastered")
     applied_master_gain = db_to_gain(master_report["applied_gain_db"])
     exported_song = exported_heartbeat = None
-    if export_stems:
+    if need_stems:
         assert stem_song_source is not None
         exported_song = stem_song_source * applied_master_gain
         exported_heartbeat = heartbeat_track * applied_master_gain
@@ -560,7 +685,8 @@ def process_music_bytes(
             "cycle_source": "multi_cycle_pool" if heartbeat_result.get("cycle_pool") else "cleanest_loop",
         },
         "render": {
-            "duration_seconds": duration,
+            "duration_seconds": output_duration,
+            "song_duration_seconds": duration,
             "is_preview": render_duration_seconds is not None and duration < full_duration - 1e-6,
             "pulse_count": len(schedule),
             "pulse_mode_requested": params.pulse_mode,
@@ -569,8 +695,23 @@ def process_music_bytes(
             "beats_per_bar": params.beats_per_bar,
             "song_gain_db": song_gain_db,
             "heartbeat_gain_db": heartbeat_gain_db,
-            "model_backed_pulse_count": int(sum(bool(item.get("model_backed", True)) for item in schedule)),
-            "guide_pulse_count": int(sum(not bool(item.get("model_backed", True)) for item in schedule)),
+            "model_backed_pulse_count": int(
+                sum(
+                    item.get("timeline") == "song"
+                    and bool(item.get("model_backed", True))
+                    for item in schedule
+                )
+            ),
+            "guide_pulse_count": int(
+                sum(
+                    item.get("timeline") == "song"
+                    and not bool(item.get("model_backed", True))
+                    for item in schedule
+                )
+            ),
+            "intro_outro_pulse_count": int(
+                sum(item.get("timeline") != "song" for item in schedule)
+            ),
             "guide_constraint_relaxation_count": int(
                 max((item.get("guide_constraint_relaxations", 0) for item in schedule), default=0)
             ),
@@ -581,7 +722,14 @@ def process_music_bytes(
             "regions": [asdict(edit) for edit in edits],
             "style_preset": params.style_preset,
             "groove_offset_ms": [float(item.get("groove_offset_ms", 0.0)) for item in schedule],
+            "song_offset_seconds": song_offset,
+            "requested_intro_pulses": int(params.intro_pulses),
+            "effective_intro_pulses": int(arrangement["effective_intro_pulses"]),
+            "outro_pulses": int(arrangement["outro_pulses"]),
+            "shifted_beat_times_seconds": arrangement["shifted_beat_times_seconds"],
+            "shifted_downbeat_times_seconds": arrangement["shifted_downbeat_times_seconds"],
         },
+        "content_trim": content_trim,
         "heartbeat_character": character_report,
         "ducking": duck_report,
         "master": master_report,
@@ -597,6 +745,29 @@ def process_music_bytes(
             "bit_depth": output_spec["bit_depth"],
         },
     }
+    run_id = disk_output.name if disk_output is not None else "memory-run"
+    sync_report = build_sync_analysis_report(
+        run_id=run_id,
+        output_dir=str(disk_output.resolve()) if disk_output is not None else "memory",
+        song_filename=song_filename,
+        heartbeat_result=heartbeat_result,
+        song_analysis=song_analysis,
+        sample_rate=sample_rate,
+        song_duration=duration,
+        output_duration=output_duration,
+        content_trim=content_trim,
+        arrangement=arrangement,
+        schedule=schedule,
+        cycles=cycles,
+        params=params,
+        total_song_gain_db=song_gain_db,
+        total_heartbeat_gain_db=heartbeat_gain_db,
+        song_loudness=song_stats_before,
+        heartbeat_loudness=heartbeat_stats_before,
+        master_report=master_report,
+        anchor_error_ms=anchor_report["maximum_error_ms"],
+    )
+    report["sync_contract"] = sync_report
     metadata_artifacts = {
         "mix_report.json": json.dumps(report, indent=2, ensure_ascii=False).encode("utf-8"),
         "heartbeat_timeline.csv": timeline.to_csv(index=False).encode("utf-8"),
@@ -604,28 +775,72 @@ def process_music_bytes(
             [asdict(edit) for edit in edits], indent=2, ensure_ascii=False
         ).encode("utf-8"),
     }
+    if contract_exports:
+        metadata_artifacts[SYNC_OUTPUT_FILES["report"]] = json.dumps(
+            sync_report,
+            indent=2,
+            ensure_ascii=False,
+        ).encode("utf-8")
     audio_artifacts: dict[str, np.ndarray] = {str(output_spec["filename"]): mastered}
-    if export_stems:
+    if need_stems:
         assert exported_heartbeat is not None and exported_song is not None
-        audio_artifacts.update(
-            {
-                "heartbeat_aligned.wav": exported_heartbeat,
-                "song_processed.wav": exported_song,
-            }
-        )
-    if export_debug:
+        audio_artifacts["heartbeat_aligned.wav"] = exported_heartbeat
+        if export_stems:
+            audio_artifacts["song_processed.wav"] = exported_song
+    if need_debug:
+        assert debug_song_source is not None
         audio_artifacts["debug_click_mix.wav"] = make_click_mix(
-            mastered,
-            beat_grid,
+            debug_song_source * applied_master_gain,
+            np.asarray(arrangement["shifted_beat_times_seconds"], dtype=np.float64),
             sample_rate,
             params.beats_per_bar,
+        )
+    if contract_exports:
+        audio_artifacts[SYNC_OUTPUT_FILES["mix"]] = mastered
+        audio_artifacts[SYNC_OUTPUT_FILES["heartbeat_check"]] = heartbeat_detection_audio(
+            heartbeat_result,
+            sample_rate,
+            mastered.shape[1],
         )
 
     result = {
         "sample_rate": sample_rate,
-        "duration_seconds": duration,
+        "duration_seconds": output_duration,
+        "song_duration_seconds": duration,
         "report": report,
         "schedule": schedule,
+        "sync_summary": {
+            "run_id": run_id,
+            "song_bpm": round(float(song_analysis["estimated_bpm"]), 3),
+            "song_meter": int(song_analysis.get("meter", params.beats_per_bar)),
+            "song_analysis_source": song_analysis.get("backend", "librosa"),
+            "song_analysis_device": "cpu",
+            "heartbeat_bpm": round(heartbeat_bpm, 3),
+            "pulse_factor": sync_report["arrangement"]["pulse_factor"],
+            "pulse_bpm": round(sync_report["arrangement"]["pulse_bpm"], 3),
+            "automatic_song_gain_db": round(song_gain_db - params.song_gain_db, 3),
+            "automatic_heartbeat_gain_db": round(
+                heartbeat_gain_db - params.heartbeat_gain_db, 3
+            ),
+            "mix_lufs": round(master_report["output_lufs"], 3),
+            "output_peak_dbfs": round(master_report["output_peak_dbfs"], 3),
+            "removed_leading_seconds": round(
+                float(content_trim.get("removed_leading_seconds", 0.0)), 3
+            ),
+            "removed_trailing_seconds": round(
+                float(content_trim.get("removed_trailing_seconds", 0.0)), 3
+            ),
+            "test_truncation_seconds": round(
+                float(content_trim.get("test_truncation_seconds", 0.0)), 3
+            ),
+            "selected_heartbeat_cycles": sync_report["heartbeat_analysis"][
+                "selected_cycle_indices"
+            ],
+            "output_dir": str(disk_output.resolve()) if disk_output is not None else "memory",
+            "files": dict(SYNC_OUTPUT_FILES),
+            "exports_enabled": contract_exports,
+            "warnings": sync_report["loudness_analysis"]["warnings"],
+        },
     }
     if disk_output is None:
         artifacts: dict[str, bytes] = {}
@@ -633,7 +848,12 @@ def process_music_bytes(
             if name == output_spec["filename"]:
                 artifacts[name] = encode_audio_bytes(sample_rate, values, output_spec)
             else:
-                artifacts[name] = encode_audio_bytes(sample_rate, values, audio_export_spec("wav16"))
+                auxiliary_spec = (
+                    audio_export_spec("wav24")
+                    if contract_exports and name in set(SYNC_OUTPUT_FILES.values())
+                    else audio_export_spec("wav16")
+                )
+                artifacts[name] = encode_audio_bytes(sample_rate, values, auxiliary_spec)
         artifacts.update(metadata_artifacts)
         result["artifacts"] = artifacts
         if create_zip:
@@ -642,7 +862,13 @@ def process_music_bytes(
         artifact_paths: dict[str, str] = {}
         for name, values in audio_artifacts.items():
             path = disk_output / name
-            spec = output_spec if name == output_spec["filename"] else audio_export_spec("wav16")
+            spec = (
+                output_spec
+                if name == output_spec["filename"]
+                else audio_export_spec("wav24")
+                if contract_exports and name in set(SYNC_OUTPUT_FILES.values())
+                else audio_export_spec("wav16")
+            )
             write_audio_file(path, sample_rate, values, spec)
             artifact_paths[name] = str(path)
         for name, values in metadata_artifacts.items():
@@ -698,6 +924,77 @@ def read_song_bytes(
         "sample_rate": int(sample_rate),
         "channels": int(audio.shape[1]),
     }
+
+
+def trim_song_content(
+    audio: np.ndarray,
+    sample_rate: int,
+    *,
+    enabled: bool = True,
+    top_db: float = 30.0,
+    padding_seconds: float = 0.12,
+    manual_start_seconds: float | None = None,
+    manual_end_seconds: float | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Trim waiting time while preserving quiet musical intros and fade-outs."""
+    values = np.asarray(audio, dtype=np.float32)
+    duration = len(values) / sample_rate
+    if enabled and len(values):
+        _, strong = librosa.effects.trim(
+            values.T,
+            top_db=float(top_db),
+            frame_length=2048,
+            hop_length=512,
+            aggregate=np.max,
+        )
+        conservative_db = max(50.0, float(top_db))
+        _, quiet = librosa.effects.trim(
+            values.T,
+            top_db=conservative_db,
+            frame_length=2048,
+            hop_length=512,
+            aggregate=np.max,
+        )
+        strong_start = float(strong[0] / sample_rate)
+        quiet_start = float(quiet[0] / sample_rate)
+        if strong_start - quiet_start >= 2.0:
+            selected_start = strong_start
+            source = "librosa-hybrid-trim+long-low-level-residue"
+        else:
+            selected_start = quiet_start
+            source = "librosa-hybrid-trim"
+        detected_start = max(0.0, selected_start - float(padding_seconds))
+        detected_end = min(
+            duration,
+            float(quiet[1] / sample_rate) + float(padding_seconds),
+        )
+    else:
+        detected_start = 0.0
+        detected_end = duration
+        source = "disabled"
+
+    start = detected_start if manual_start_seconds is None else float(manual_start_seconds)
+    end = detected_end if manual_end_seconds is None else float(manual_end_seconds)
+    start = float(np.clip(start, 0.0, duration))
+    end = float(np.clip(end, 0.0, duration))
+    if end <= start:
+        raise ValueError("Song content end must be later than its start.")
+    start_sample = int(round(start * sample_rate))
+    end_sample = int(round(end * sample_rate))
+    if manual_start_seconds is not None or manual_end_seconds is not None:
+        source += "+manual-override"
+    report = {
+        "enabled": bool(enabled),
+        "source": source,
+        "detected_start_seconds": float(detected_start),
+        "detected_end_seconds": float(detected_end),
+        "used_start_seconds": float(start_sample / sample_rate),
+        "used_end_seconds": float(end_sample / sample_rate),
+        "removed_leading_seconds": float(start_sample / sample_rate),
+        "removed_trailing_seconds": float(duration - end_sample / sample_rate),
+        "threshold_top_db": float(top_db),
+    }
+    return values[start_sample:end_sample].astype(np.float32, copy=True), report
 
 
 def _beat_features(
@@ -1245,6 +1542,132 @@ def build_region_schedule(
     return deduplicated
 
 
+def add_intro_outro_arrangement(
+    schedule: list[dict[str, Any]],
+    beat_grid: np.ndarray,
+    downbeats: np.ndarray,
+    song_duration: float,
+    *,
+    intro_pulses: int,
+    outro_pulses: int,
+    heartbeat_bpm: float,
+    fit_mode: str,
+) -> dict[str, Any]:
+    """Map processed-song time onto the final mix timeline with heartbeat edges."""
+    song_schedule = [dict(item) for item in schedule]
+    source_times = np.asarray(
+        [item["time_seconds"] for item in song_schedule],
+        dtype=np.float64,
+    )
+    beat_values = np.asarray(beat_grid, dtype=np.float64)
+    intervals = np.diff(source_times)
+    intervals = intervals[np.isfinite(intervals) & (intervals > 0.08)]
+    if not len(intervals):
+        beat_intervals = np.diff(beat_values)
+        beat_intervals = beat_intervals[
+            np.isfinite(beat_intervals) & (beat_intervals > 0.08)
+        ]
+        intervals = beat_intervals
+    pulse_interval = (
+        float(np.median(intervals))
+        if len(intervals)
+        else 60.0 / max(float(heartbeat_bpm), 1e-6)
+    )
+    first_song_pulse = (
+        float(source_times[0])
+        if len(source_times)
+        else float(beat_values[0]) if len(beat_values) else 0.0
+    )
+    effective_intro = max(
+        max(0, int(intro_pulses)),
+        int(np.ceil(max(0.0, first_song_pulse) / pulse_interval)),
+    )
+    first_output_pulse = effective_intro * pulse_interval
+    song_offset = max(0.0, first_output_pulse - first_song_pulse)
+
+    for item in song_schedule:
+        item["time_seconds"] = float(item["time_seconds"] + song_offset)
+        if "target_time_seconds" in item:
+            item["target_time_seconds"] = float(
+                item["target_time_seconds"] + song_offset
+            )
+        item["timeline"] = "song"
+
+    intro_times = first_output_pulse - np.arange(
+        effective_intro,
+        0,
+        -1,
+        dtype=np.float64,
+    ) * pulse_interval
+    intro_schedule = [
+        {
+            "pulse_index": 0,
+            "time_seconds": float(time_seconds),
+            "target_time_seconds": float(time_seconds),
+            "groove_offset_ms": 0.0,
+            "pulse_mode": "intro",
+            "fit_mode": fit_mode,
+            "region": "Intro",
+            "model_backed": False,
+            "section_energy": 0.5,
+            "velocity": 1.0,
+            "guide_constraint_relaxations": 0,
+            "timeline": "intro",
+        }
+        for time_seconds in intro_times
+        if time_seconds >= -1e-7
+    ]
+
+    song_end = song_offset + float(song_duration)
+    if song_schedule:
+        last_pulse = float(song_schedule[-1]["time_seconds"])
+    elif intro_schedule:
+        last_pulse = float(intro_schedule[-1]["time_seconds"])
+    else:
+        last_pulse = song_offset
+    next_after_song = last_pulse + pulse_interval
+    while next_after_song <= song_end + 1e-9:
+        next_after_song += pulse_interval
+    outro_times = next_after_song + np.arange(
+        max(0, int(outro_pulses)),
+        dtype=np.float64,
+    ) * pulse_interval
+    outro_schedule = [
+        {
+            "pulse_index": 0,
+            "time_seconds": float(time_seconds),
+            "target_time_seconds": float(time_seconds),
+            "groove_offset_ms": 0.0,
+            "pulse_mode": "outro",
+            "fit_mode": fit_mode,
+            "region": "Outro",
+            "model_backed": False,
+            "section_energy": 0.5,
+            "velocity": 1.0,
+            "guide_constraint_relaxations": 0,
+            "timeline": "outro",
+        }
+        for time_seconds in outro_times
+    ]
+    combined = [*intro_schedule, *song_schedule, *outro_schedule]
+    combined.sort(key=lambda item: item["time_seconds"])
+    for index, item in enumerate(combined):
+        item["pulse_index"] = index
+    return {
+        "schedule": combined,
+        "song_offset_seconds": float(song_offset),
+        "song_end_seconds": float(song_end),
+        "pulse_interval_seconds": float(pulse_interval),
+        "requested_intro_pulses": int(intro_pulses),
+        "effective_intro_pulses": len(intro_schedule),
+        "outro_pulses": len(outro_schedule),
+        "shifted_beat_times_seconds": (beat_values + song_offset).tolist(),
+        "shifted_downbeat_times_seconds": (
+            np.asarray(downbeats, dtype=np.float64) + song_offset
+        ).tolist(),
+    }
+
+
 def _detect_s1_anchor(audio: np.ndarray, sample_rate: int) -> int:
     values = np.max(np.abs(np.asarray(audio, dtype=np.float32)), axis=1)
     if not len(values):
@@ -1279,7 +1702,10 @@ def _active_cycle_samples(audio: np.ndarray, sample_rate: int, anchor: int) -> i
     return int(np.clip(tail, anchor + 1, len(audio)))
 
 
-def extract_heartbeat_cycles(result: dict[str, Any]) -> tuple[list[HeartbeatCycle], int]:
+def extract_heartbeat_cycles(
+    result: dict[str, Any],
+    requested_cycles: int | None = None,
+) -> tuple[list[HeartbeatCycle], int]:
     sample_rate = int(result["sample_rate"])
     pooled = result.get("cycle_pool") or []
     pooled_cycles: list[HeartbeatCycle] = []
@@ -1301,6 +1727,36 @@ def extract_heartbeat_cycles(result: dict[str, Any]) -> tuple[list[HeartbeatCycl
             )
         )
     if pooled_cycles:
+        requested = max(1, int(requested_cycles or len(pooled_cycles)))
+        if len(pooled_cycles) > requested:
+            pooled_cycles.sort(key=lambda cycle: cycle.source_cycle_index)
+            contiguous = [
+                pooled_cycles[index : index + requested]
+                for index in range(len(pooled_cycles) - requested + 1)
+                if np.all(
+                    np.diff(
+                        [
+                            cycle.source_cycle_index
+                            for cycle in pooled_cycles[index : index + requested]
+                        ]
+                    )
+                    == 1
+                )
+            ]
+            if contiguous:
+                pooled_cycles = max(
+                    contiguous,
+                    key=lambda window: float(
+                        np.mean([cycle.quality_score for cycle in window])
+                    ),
+                )
+            else:
+                pooled_cycles = sorted(
+                    pooled_cycles,
+                    key=lambda cycle: cycle.quality_score,
+                    reverse=True,
+                )[:requested]
+                pooled_cycles.sort(key=lambda cycle: cycle.source_cycle_index)
         return pooled_cycles, sample_rate
 
     audio = np.asarray(result["cleanest_audio"], dtype=np.float32)
@@ -1349,6 +1805,8 @@ def extract_heartbeat_cycles(result: dict[str, Any]) -> tuple[list[HeartbeatCycl
             )
     if not cycles:
         raise ValueError("No usable heartbeat cycle was found in the selected clean loop.")
+    if requested_cycles is not None:
+        cycles = cycles[: max(1, int(requested_cycles))]
     return cycles, sample_rate
 
 
@@ -1524,6 +1982,96 @@ def arrangement_fade_envelope(
     return envelope
 
 
+def final_timeline_heartbeat_envelope(
+    sample_count: int,
+    sample_rate: int,
+    song_offset_seconds: float,
+    song_duration_seconds: float,
+    heartbeat_start_seconds: float,
+    heartbeat_end_seconds: float | None,
+    fade_in_seconds: float,
+    fade_out_seconds: float,
+) -> np.ndarray:
+    """Keep intro/outro pulses while applying the selected range inside the song."""
+    envelope = np.ones(sample_count, dtype=np.float32)
+    song_start = int(np.clip(round(song_offset_seconds * sample_rate), 0, sample_count))
+    song_end = int(
+        np.clip(
+            round((song_offset_seconds + song_duration_seconds) * sample_rate),
+            song_start,
+            sample_count,
+        )
+    )
+    envelope[song_start:song_end] = 0.0
+    active_start = int(
+        np.clip(
+            round((song_offset_seconds + heartbeat_start_seconds) * sample_rate),
+            song_start,
+            song_end,
+        )
+    )
+    end_seconds = (
+        song_duration_seconds
+        if heartbeat_end_seconds is None
+        else min(song_duration_seconds, float(heartbeat_end_seconds))
+    )
+    active_end = int(
+        np.clip(
+            round((song_offset_seconds + end_seconds) * sample_rate),
+            active_start,
+            song_end,
+        )
+    )
+    envelope[active_start:active_end] = 1.0
+    fade_in = min(
+        active_end - active_start,
+        max(0, int(round(float(fade_in_seconds) * sample_rate))),
+    )
+    fade_out = min(
+        active_end - active_start,
+        max(0, int(round(float(fade_out_seconds) * sample_rate))),
+    )
+    if fade_in > 1:
+        envelope[active_start : active_start + fade_in] *= np.sin(
+            np.linspace(0.0, np.pi * 0.5, fade_in, dtype=np.float32)
+        ) ** 2
+    if fade_out > 1:
+        envelope[active_end - fade_out : active_end] *= np.cos(
+            np.linspace(0.0, np.pi * 0.5, fade_out, dtype=np.float32)
+        ) ** 2
+    return envelope
+
+
+def intro_outro_boost_envelope(
+    sample_count: int,
+    sample_rate: int,
+    song_offset_seconds: float,
+    song_duration_seconds: float,
+    boost_db: float,
+    transition_seconds: float = 0.25,
+) -> np.ndarray:
+    gain = np.ones(sample_count, dtype=np.float32)
+    boost = db_to_gain(boost_db)
+    song_start = int(np.clip(round(song_offset_seconds * sample_rate), 0, sample_count))
+    song_end = int(
+        np.clip(
+            round((song_offset_seconds + song_duration_seconds) * sample_rate),
+            song_start,
+            sample_count,
+        )
+    )
+    transition = max(1, int(round(transition_seconds * sample_rate)))
+    left = max(0, song_start - transition)
+    gain[:left] = boost
+    if song_start > left:
+        gain[left:song_start] = np.linspace(boost, 1.0, song_start - left, dtype=np.float32)
+    right = min(sample_count, song_end + transition)
+    if right > song_end:
+        gain[song_end:right] = np.linspace(1.0, boost, right - song_end, dtype=np.float32)
+    gain[right:] = boost
+    return gain
+
+
 def apply_heartbeat_character(
     audio: np.ndarray,
     sample_rate: int,
@@ -1534,8 +2082,7 @@ def apply_heartbeat_character(
     reverb_decay_ms: float,
 ) -> tuple[np.ndarray, dict[str, float]]:
     """Apply lightweight, online-safe tone shaping without replacing the heartbeat."""
-    source = np.asarray(audio, dtype=np.float32)
-    output = source.copy()
+    output = np.asarray(audio, dtype=np.float32)
     if not output.size:
         return output, {
             "presence_db": float(presence_db),
@@ -1552,7 +2099,9 @@ def apply_heartbeat_character(
     if amount > 1e-6:
         drive = 1.0 + 3.5 * amount
         shaped = np.tanh(output * drive).astype(np.float32) / drive
-        output = (1.0 - amount) * output + amount * shaped
+        output *= 1.0 - amount
+        output += amount * shaped
+        del shaped
     wet = float(np.clip(reverb_mix, 0.0, 0.45))
     decay_seconds = float(np.clip(reverb_decay_ms, 60.0, 1200.0)) / 1000.0
     if wet > 1e-6:
@@ -1561,7 +2110,9 @@ def apply_heartbeat_character(
             delay = max(1, int(round(decay_seconds * fraction * sample_rate)))
             if delay < len(output):
                 reverberant[delay:] += output[:-delay] * gain
-        output = (1.0 - wet) * output + wet * reverberant
+        output *= 1.0 - wet
+        output += wet * reverberant
+        del reverberant
     return output.astype(np.float32, copy=False), {
         "presence_db": float(presence_db),
         "presence_band_low_hz": 45.0,
@@ -1701,6 +2252,188 @@ def make_click_mix(
             output[begin:finish] += click[: finish - begin, None]
     peak = float(np.max(np.abs(output))) if output.size else 0.0
     return output / max(1.0, peak / db_to_gain(-1.0))
+
+
+def heartbeat_detection_audio(
+    heartbeat_result: dict[str, Any],
+    target_rate: int,
+    channels: int,
+) -> np.ndarray:
+    artifact = heartbeat_result.get("artifacts", {}).get("heartbeat_detection_mix.wav")
+    if artifact:
+        values, source_rate = sf.read(
+            io.BytesIO(artifact),
+            dtype="float32",
+            always_2d=True,
+        )
+    else:
+        cleaned = heartbeat_result.get("artifacts", {}).get("cleaned.wav")
+        if not cleaned:
+            return np.zeros((1, channels), dtype=np.float32)
+        values, source_rate = sf.read(
+            io.BytesIO(cleaned),
+            dtype="float32",
+            always_2d=True,
+        )
+    if int(source_rate) != int(target_rate):
+        values = resample_audio(values, int(source_rate), int(target_rate))
+    if values.shape[1] == 1 and channels > 1:
+        values = np.repeat(values, channels, axis=1)
+    elif values.shape[1] != channels:
+        values = np.repeat(np.mean(values, axis=1, keepdims=True), channels, axis=1)
+    return np.asarray(values, dtype=np.float32)
+
+
+def build_sync_analysis_report(
+    *,
+    run_id: str,
+    output_dir: str,
+    song_filename: str,
+    heartbeat_result: dict[str, Any],
+    song_analysis: dict[str, Any],
+    sample_rate: int,
+    song_duration: float,
+    output_duration: float,
+    content_trim: dict[str, Any],
+    arrangement: dict[str, Any],
+    schedule: list[dict[str, Any]],
+    cycles: list[HeartbeatCycle],
+    params: MixParams,
+    total_song_gain_db: float,
+    total_heartbeat_gain_db: float,
+    song_loudness: dict[str, float],
+    heartbeat_loudness: dict[str, float],
+    master_report: dict[str, float],
+    anchor_error_ms: float,
+) -> dict[str, Any]:
+    song_pulses = [
+        float(item["time_seconds"])
+        for item in schedule
+        if item.get("timeline") == "song"
+    ]
+    intervals = np.diff(song_pulses)
+    intervals = intervals[np.isfinite(intervals) & (intervals > 0.08)]
+    pulse_bpm = float(60.0 / np.median(intervals)) if len(intervals) else 0.0
+    song_bpm = float(song_analysis["estimated_bpm"])
+    pulse_factor = float(pulse_bpm / song_bpm) if song_bpm > 0 else 0.0
+    cycle_indices = [cycle.source_cycle_index for cycle in cycles]
+    selected_range = [
+        int(min(cycle_indices, default=0)),
+        int(max(cycle_indices, default=-1) + 1),
+    ]
+    warnings = [
+        *song_analysis.get("warnings", []),
+        *heartbeat_result.get("recording_quality", {}).get("reasons", []),
+    ]
+    events = heartbeat_result.get("summary", {}).get("heartbeat_events", {})
+    return {
+        "run": {
+            "id": run_id,
+            "output_dir": output_dir,
+            "files": dict(SYNC_OUTPUT_FILES),
+            "engine": "native-sync-contract",
+            "exports_enabled": bool(params.sync_contract_exports),
+        },
+        "inputs": {
+            "heartbeat_wav": heartbeat_result.get("name", "heartbeat.wav"),
+            "song": song_filename,
+        },
+        "audio": {
+            "sample_rate": int(sample_rate),
+            "song_channels": int(song_analysis.get("channels", 1)),
+            "heartbeat_original_sample_rate": int(heartbeat_result["sample_rate"]),
+            "song_original_duration_seconds": float(
+                song_analysis.get("original_duration_seconds", song_duration)
+            ),
+            "song_processed_duration_seconds": float(song_duration),
+            "final_mix_duration_seconds": float(output_duration),
+        },
+        "content_trim": dict(content_trim),
+        "song_analysis": {
+            "bpm": song_bpm,
+            "duration_seconds": float(song_duration),
+            "meter": int(song_analysis.get("meter", params.beats_per_bar)),
+            "beat_times_seconds": list(song_analysis.get("beat_grid_times_seconds", [])),
+            "downbeat_times_seconds": list(song_analysis.get("downbeat_times_seconds", [])),
+            "source": song_analysis.get("backend", "librosa"),
+            "device": "cpu",
+            "warnings": list(song_analysis.get("warnings", [])),
+        },
+        "heartbeat_analysis": {
+            "bpm": float(
+                heartbeat_result.get("summary", {})
+                .get("tempo", {})
+                .get("estimated_bpm", 0.0)
+            ),
+            "period_seconds": float(60.0 / max(
+                heartbeat_result.get("summary", {})
+                .get("tempo", {})
+                .get("estimated_bpm", 75.0),
+                1e-6,
+            )),
+            "active_duration_seconds": float(
+                max((cycle.active_samples for cycle in cycles), default=0) / sample_rate
+            ),
+            "cycle_onsets_seconds": np.asarray(
+                heartbeat_result.get("beat_times", []), dtype=float
+            ).tolist(),
+            "s1_peak_times_seconds": list(events.get("s1_peak_times_seconds", [])),
+            "s2_peak_times_seconds": list(events.get("s2_peak_times_seconds", [])),
+            "source": "heartbeat-preprocessor-v2",
+            "warnings": list(
+                heartbeat_result.get("recording_quality", {}).get("reasons", [])
+            ),
+            "selected_cycle_indices": selected_range,
+        },
+        "arrangement": {
+            "pulse_mode_requested": params.pulse_mode,
+            "pulse_factor": pulse_factor,
+            "pulse_bpm": pulse_bpm,
+            "pulse_grid_source": "local-adaptive-beat/downbeat-grid",
+            "song_offset_seconds": float(arrangement["song_offset_seconds"]),
+            "requested_intro_pulses": int(arrangement["requested_intro_pulses"]),
+            "effective_intro_pulses": int(arrangement["effective_intro_pulses"]),
+            "outro_pulses": int(arrangement["outro_pulses"]),
+            "beats_per_loop": int(params.beats_per_loop),
+            "pulse_times_seconds": [float(item["time_seconds"]) for item in schedule],
+            "shifted_downbeat_times_seconds": list(
+                arrangement["shifted_downbeat_times_seconds"]
+            ),
+            "automatic_song_gain_db": float(total_song_gain_db - params.song_gain_db),
+            "automatic_heartbeat_gain_db": float(
+                total_heartbeat_gain_db - params.heartbeat_gain_db
+            ),
+            "song_gain_db": float(params.song_gain_db),
+            "heartbeat_gain_adjustment_db": float(params.heartbeat_gain_db),
+            "total_song_gain_before_peak_protection_db": float(total_song_gain_db),
+            "total_heartbeat_gain_before_peak_protection_db": float(
+                total_heartbeat_gain_db
+            ),
+            "heartbeat_relative_lu": float(params.heartbeat_relative_lu),
+            "intro_outro_boost_db": float(params.intro_outro_boost_db),
+            "fit_mode": params.fit_mode,
+        },
+        "loudness_analysis": {
+            "standard": "ITU-R BS.1770-4 (pyloudnorm)",
+            "automatic_enabled": bool(params.auto_balance),
+            "song_target_integrated_lufs": float(params.song_target_lufs),
+            "song_input_integrated_lufs": float(song_loudness["integrated_lufs"]),
+            "song_input_active_lufs": float(song_loudness["active_lufs"]),
+            "heartbeat_input_integrated_lufs": float(
+                heartbeat_loudness["integrated_lufs"]
+            ),
+            "heartbeat_input_active_lufs": float(heartbeat_loudness["active_lufs"]),
+            "output_mix_integrated_lufs": float(master_report["output_lufs"]),
+            "output_peak_dbfs": float(master_report["output_peak_dbfs"]),
+            "warnings": warnings,
+        },
+        "alignment": {
+            "construction": "s1-anchor-scheduled-to-local-beat/downbeat-grid",
+            "sample_placement_quantization_error_samples_max": 0.5,
+            "maximum_anchor_alignment_error_ms": float(anchor_error_ms),
+            "note": "Placement precision is not beat-detection accuracy.",
+        },
+    }
 
 
 def _edge_fade(audio: np.ndarray, sample_rate: int, fade_ms: float) -> np.ndarray:

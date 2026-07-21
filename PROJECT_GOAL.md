@@ -22,6 +22,21 @@
 | 网站容易崩溃 | 保留单任务锁、磁盘流式结果和过期清理；Session State 只保留多周期短素材与小型分析数据 | 完成 |
 | 云端重模型风险 | Community Cloud 继续使用在线安全 DSP；Beat This、Demucs、生成式换风格保留为独立 worker 扩展 | 后续扩展 |
 
+## heartbeat_sync 迁移合同（2026-07-21）
+
+| 合同项 | 实施目标 | 状态 |
+|---|---|---|
+| 黑盒集成边界 | 不导入、不修改目标仓库内部模块；Windows 环境仅调用 `.venv\\Scripts\\python.exe -m heartbeat_sync` | 完成 |
+| 云端可运行性 | Linux Streamlit Cloud 使用原生合同兼容实现；配置仓库路径后自动提供官方 CLI | 完成 |
+| 歌曲内容裁剪 | 强/保守双阈值混合检测、手动起止覆盖、报告原始/处理区间 | 完成 |
+| 节拍后端 | 官方 CLI 暴露 auto/Beat This/librosa 与 auto/cpu/cuda；原生引擎明确报告 librosa fallback | 完成 |
+| 连续真实周期循环 | 默认选取质量最好的连续 4 个心跳周期，可调 1–16 | 完成 |
+| 片头片尾编排 | 默认歌曲前后各 4 次心跳，歌曲时间整体平移，边缘默认增强 4 dB | 完成 |
+| 心跳诊断 | 估计 S1/S2 并生成独立检测点击检查轨 | 完成 |
+| 固定输出合同 | 可选生成五个固定名称、PCM 24-bit 文件及完整 `analysis_report.json` | 完成 |
+| 预览/最终隔离 | 45 秒只用于预览；最终渲染不传 `max_song_seconds` | 完成 |
+| 安全与并发 | 参数数组、无 shell、任务目录隔离、Unicode/空格路径、输出越界验证、非零退出安全显示 | 完成 |
+
 ## A. 网页稳定性与资源问题
 
 | 问题 | 根因 | 修改目标 | 状态 |
@@ -108,11 +123,11 @@
 
 ## 当前验证记录（2026-07-21 V2）
 
-- 自动化测试：`34/34` 通过，新增工频陷波、相位噪声模型、多周期池、S1/S2 preserve、groove/kick、风格差异和 MP3/FLAC 导出回归。
+- 自动化测试：`39/39` 通过；除原有降噪、groove、MP3/FLAC 回归外，新增混合裁剪、片头片尾、五文件 PCM24、Unicode/空格 CLI 路径、输出越界和错误传播验证。
 - `py_compile` 与 `git diff --check`：通过。
 - Streamlit AppTest：`0` 个页面启动异常；本地浏览器确认新降噪控制和 WAV/MP3 双上传入口正常显示。
-- 真实端到端输入：`sample_13s_input.wav` + 32.51 秒、44.1 kHz 立体声 CC MP3。
-- 调度：28 个 model-backed pulse、0 个 guide pulse，最大 S1 排程误差 `0.0 ms`。
-- 母带：约 `-16.61 LUFS`、`-1.67 dBFS`；峰值 RSS 约 `299.4 MB`。
-- 默认 MP3 输出：`470,313` bytes，小于歌曲 MP3 与心跳 WAV 的输入大小总和；同流程 FLAC16 为 `2,070,954` bytes，说明无损格式不保证小于已压缩源文件。
+- 新迁移端到端输入：`sample_13s_input.wav` + 145 秒、44.1 kHz 立体声 MP3。
+- 调度：95 个 model-backed pulse、0 个 guide pulse，另含 8 个片头/片尾 pulse；最大 S1 排程误差 `0.0 ms`。
+- 母带：约 `-16.54 LUFS`、`-1.27 dBFS`；消除整曲重复数组后，峰值 RSS 从约 `497.4 MB` 降至 `392.3 MB`。
+- 默认 MP3 输出约 `2.43 MB`；24-bit 五文件兼容包为显式可选，因为无损多轨必然显著增加输出体积。
 - 真实输出保存在被 Git 忽略的 `tmp/real_validation_*`，不进入发布提交。

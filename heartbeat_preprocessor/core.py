@@ -194,6 +194,14 @@ def process_audio_bytes(
     filtered_audio = normalize_for_wav(filtered, target_peak=export_target_peak)
     cleaned_audio = normalize_for_wav(cleaned, target_peak=export_target_peak)
     cleanest_audio = normalize_for_wav(cleanest_audio, target_peak=export_target_peak)
+    s1_times = np.asarray(beat_times, dtype=np.float64)
+    s2_times = detect_secondary_heart_sounds(cleaned_audio, sr, s1_times)
+    heartbeat_detection_audio = make_heartbeat_detection_mix(
+        cleaned_audio,
+        sr,
+        s1_times,
+        s2_times,
+    )
     cycle_pool = build_heartbeat_cycle_pool(
         cleaned_audio,
         sr,
@@ -251,6 +259,10 @@ def process_audio_bytes(
         "requested_count": int(params.cycle_pool_size),
         "source_cycle_indices": [int(item["source_cycle_index"]) for item in cycle_pool],
     }
+    tempo_summary["heartbeat_events"] = {
+        "s1_peak_times_seconds": s1_times.tolist(),
+        "s2_peak_times_seconds": s2_times.tolist(),
+    }
 
     stem = safe_stem(filename)
     if artifact_profile not in {"full", "web"}:
@@ -260,6 +272,7 @@ def process_audio_bytes(
         "cleaned.wav": wav_bytes(sr, cleaned_audio),
         "cleanest_heartbeat_loop.wav": wav_bytes(sr, cleanest_audio),
         "heartbeat_cycle_pool_preview.wav": wav_bytes(sr, cycle_pool_preview),
+        "heartbeat_detection_mix.wav": wav_bytes(sr, heartbeat_detection_audio),
     }
     artifacts = dict(preview_artifacts)
     if artifact_profile == "full":
@@ -348,6 +361,8 @@ def process_audio_bytes(
         "cycle_pool": cycle_pool,
         "hum_suppression": hum_suppression,
         "phase_noise_reduction": phase_noise_reduction,
+        "s1_times": s1_times,
+        "s2_times": s2_times,
         "playback_audio": playback_audio,
         "segment_candidates": segment_candidates,
         "artifacts": artifacts,
@@ -1537,6 +1552,63 @@ def build_heartbeat_cycle_pool(
     # Keep playback variation deterministic while avoiding a repeated quality gradient.
     selected.sort(key=lambda item: item["source_cycle_index"])
     return selected
+
+
+def detect_secondary_heart_sounds(
+    audio: np.ndarray,
+    sr: int,
+    s1_times: np.ndarray,
+) -> np.ndarray:
+    """Estimate one S2 energy peak inside each complete cardiac cycle."""
+    values = np.abs(np.asarray(audio, dtype=np.float32))
+    beats = np.asarray(s1_times, dtype=np.float64)
+    if not len(values) or len(beats) < 2 or sr <= 0:
+        return np.asarray([], dtype=np.float64)
+    smooth = max(1, int(round(0.018 * sr)))
+    envelope = np.convolve(values, np.ones(smooth) / smooth, mode="same")
+    s2_times: list[float] = []
+    for left, right in zip(beats[:-1], beats[1:]):
+        period = float(right - left)
+        if period <= 0.2:
+            continue
+        start = int(np.clip(round((left + 0.16 * period) * sr), 0, len(envelope)))
+        end = int(np.clip(round((left + 0.58 * period) * sr), start, len(envelope)))
+        if end <= start:
+            continue
+        peak = start + int(np.argmax(envelope[start:end]))
+        s2_times.append(float(peak / sr))
+    return np.asarray(s2_times, dtype=np.float64)
+
+
+def make_heartbeat_detection_mix(
+    audio: np.ndarray,
+    sr: int,
+    s1_times: np.ndarray,
+    s2_times: np.ndarray,
+) -> np.ndarray:
+    """Overlay distinct S1/S2 clicks for diagnosis; never use this as a mix source."""
+    output = np.asarray(audio, dtype=np.float32).copy() * 0.72
+    if not len(output) or sr <= 0:
+        return output
+
+    def add_click(times: np.ndarray, frequency: float, amplitude: float) -> None:
+        length = max(1, int(round(0.035 * sr)))
+        local = np.arange(length, dtype=np.float64) / sr
+        click = (
+            amplitude
+            * np.sin(2.0 * np.pi * frequency * local)
+            * np.exp(-local * 75.0)
+        ).astype(np.float32)
+        for time_seconds in np.asarray(times, dtype=np.float64):
+            start = int(round(float(time_seconds) * sr))
+            end = min(len(output), start + length)
+            if 0 <= start < len(output) and end > start:
+                output[start:end] += click[: end - start]
+
+    add_click(s1_times, 1400.0, 0.20)
+    add_click(s2_times, 620.0, 0.16)
+    peak = float(np.max(np.abs(output))) if len(output) else 0.0
+    return output / max(1.0, peak / peak_from_dbfs(-1.0))
 
 
 def concatenate_cycle_pool(

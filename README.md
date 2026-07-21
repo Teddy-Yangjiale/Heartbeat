@@ -9,6 +9,7 @@ Heartbeat Music Processor 是一个完整的心跳驱动音乐处理网页。用
 5. 自动响度平衡、心跳触发的低频闪避、最终 LUFS 调整与峰值保护；
 6. 原声、电影感、Lo-fi、Trip-hop、极简电子、暗氛围预设；
 7. 在线试听并导出 FLAC、MP3、WAV16 或 WAV24；独立轨、检查轨和工程 ZIP 可按需生成。
+8. 兼容 `heartbeat_sync` 迁移合同：混合歌曲内容裁剪、4 周期连续循环、片头/片尾脉冲、S1/S2 检查轨、五文件 24-bit 工程包，并可连接官方 Windows 黑盒 CLI。
 
 本程序不是医疗诊断工具。心跳质量判断只用于决定录音是否适合安全降噪和音乐制作。
 
@@ -53,6 +54,13 @@ MP3 由 `soundfile` 随附的 `libsndfile` 直接解码，网页不依赖系统 
 
 若心跳被判定为 `needs_rerecording`，渲染按钮会被锁定。用户试听并明确确认后仍可覆盖此安全门控。
 
+“歌曲内容范围与 heartbeat_sync 后端”中可以：
+
+- 使用强/保守双阈值自动裁剪歌曲首尾静音，或手动覆盖歌曲起点与终点；
+- 云端使用原生兼容引擎；配置 `HEARTBEAT_SYNC_REPO` 后选择官方 `heartbeat_sync` CLI；
+- 官方 CLI 的 `auto` 后端优先 Beat This，失败时按原仓库合同回退 librosa，并把警告显示给用户；
+- 预览最多处理前 45 秒有效内容，整首最终渲染不会意外携带这个限制。
+
 ### 3. 全局参数
 
 | 参数 | 作用 |
@@ -75,6 +83,9 @@ MP3 由 `soundfile` 随附的 `libsndfile` 直接解码，网页不依赖系统 
 | 乐段动态强度 | 根据歌曲局部能量改变心跳响度，并在低能量段自动疏化 |
 | 心跳渐入/渐出 | 只控制心跳层的长包络，不改变歌曲本身 |
 | 最大拉伸倍率 | 仅限制手动选择 `stretch` 时的 time-stretch，默认 `1.10x` |
+| 每个循环的真实周期数 | 默认选择质量最好的连续 4 个周期，降低单周期重复感 |
+| 歌曲前/后心跳次数 | 默认各 4 次；歌曲整体后移，片尾在歌曲结束后继续 |
+| 片头/片尾增强 | 默认比歌曲内心跳高 4 dB，单独控制边缘听感 |
 | 最终文件格式 | 默认 MP3；另可选无损 FLAC16、WAV16 和制作母版 WAV24 |
 
 ### 4. 特定区域编辑
@@ -98,7 +109,7 @@ MP3 由 `soundfile` 随附的 `libsndfile` 直接解码，网页不依赖系统 
 - “生成前 45 秒试听”：快速检查节拍、音量和区域设置；短于 45 秒的歌曲会生成完整试听。
 - “生成整首最终音乐”：按完全相同的参数处理整首歌。
 
-默认只生成最终混音以降低网页内存。勾选“同时生成工程文件”后才会额外生成两个分轨、点击检查轨和 ZIP。每次修改 BPM、第一拍、心跳角色或区域设置后，应重新渲染并试听。
+默认只生成最终混音以降低网页内存。勾选“生成 heartbeat_sync 五文件兼容包”后会额外生成五个固定 24-bit 合同文件、歌曲轨和 ZIP。每次修改 BPM、第一拍、心跳角色或区域设置后，应重新渲染并试听。
 
 ## 输出文件
 
@@ -112,6 +123,16 @@ MP3 由 `soundfile` 随附的 `libsndfile` 直接解码，网页不依赖系统 
 | `heartbeat_timeline.csv` | 每个心跳事件的时间、密度模式、适配方式和所属区域 |
 | `region_edits.json` | 可复查的区域编辑参数 |
 | `heartbeat_music_project.zip` | 上述全部工程文件 |
+
+`heartbeat_sync` 五文件合同如下，名称固定且 WAV 均为 PCM 24-bit：
+
+| 文件 | 含义 |
+|---|---|
+| `preview_mix.wav` | 合同版最终歌曲与心跳混音 |
+| `heartbeat_aligned.wav` | 对齐后的独立心跳轨 |
+| `debug_click_mix.wav` | 歌曲与节拍/重拍点击检查轨 |
+| `heartbeat_detection_mix.wav` | 预处理心跳与 S1/S2 点击检查轨 |
+| `analysis_report.json` | `run` 到 `alignment` 的完整迁移报告 |
 
 心跳预处理阶段优先使用 `cycle_pool` 中最多 16 个真实周期进入混音；若旧结果没有素材池才回退到 `cleanest_heartbeat_loop.wav`。不会使用仅供手机试听的增响版本，避免重复增益和软削波。
 
@@ -148,6 +169,19 @@ Streamlit Community Cloud 部署：
 
 当前版本限制歌曲为 5 分钟，并以全局单任务锁保护 Community Cloud。处理报告会记录各阶段 RSS 内存。若未来需要真正的多用户并发，应保持此网页入口不变，将 `music_processor/core.py` 放到独立异步 worker 中执行，并把输入/输出放入对象存储。
 
+### 连接官方 heartbeat_sync Windows 服务
+
+当前仓库不导入、不修改 `heartbeat_sync` 内部模块，而是严格使用其公开 CLI：
+
+```powershell
+$env:HEARTBEAT_SYNC_REPO = "D:\path\to\heartbeat_sync"
+python -m streamlit run app.py
+```
+
+目标仓库必须已按其迁移文档建立仓库内 `.venv`，且存在 `.venv\Scripts\python.exe`。网页使用参数数组调用 `python.exe -m heartbeat_sync`，每个任务使用独立输入和输出目录，并验证 stdout JSON、输出路径边界和五文件完整性。Streamlit Community Cloud 是 Linux 环境，不能直接运行该 Windows/Beat This 环境，因此线上默认使用合同兼容的 librosa/DSP 引擎。
+
+逐条迁移状态见 [`SYNC_MIGRATION_STATUS.md`](SYNC_MIGRATION_STATUS.md)。
+
 ## 测试
 
 ```powershell
@@ -165,6 +199,8 @@ conda run --no-capture-output -n heartbeat python -m unittest discover -s tests 
 - 心跳到歌曲的端到端渲染；
 - 最终 WAV、独立轨、时间线、报告和 ZIP；
 - 最终峰值上限。
+- Unicode/空格路径、CLI 非 shell 调用、输出目录越界和失败信息；
+- 混合歌曲裁剪、片头片尾时轴和五个 PCM 24-bit 合同文件。
 
 ## 已知边界
 
