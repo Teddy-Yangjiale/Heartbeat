@@ -682,7 +682,7 @@ def process_music_bytes(
             "estimated_bpm": heartbeat_bpm,
             "selected_cycle_count": len(cycles),
             "source_artifact": "cleanest_heartbeat_loop.wav",
-            "cycle_source": "multi_cycle_pool" if heartbeat_result.get("cycle_pool") else "cleanest_loop",
+            "cycle_source": "cleanest_loop",
         },
         "render": {
             "duration_seconds": output_duration,
@@ -1706,60 +1706,22 @@ def extract_heartbeat_cycles(
     result: dict[str, Any],
     requested_cycles: int | None = None,
 ) -> tuple[list[HeartbeatCycle], int]:
+    """Split only the faithful best-loop excerpt into schedulable heart cycles."""
     sample_rate = int(result["sample_rate"])
-    pooled = result.get("cycle_pool") or []
-    pooled_cycles: list[HeartbeatCycle] = []
-    for fallback_index, item in enumerate(pooled):
-        values = np.asarray(item.get("audio", []), dtype=np.float32)
-        if values.ndim == 1:
-            values = values[:, None]
-        if values.ndim != 2 or len(values) < int(0.2 * sample_rate):
-            continue
-        cycle_audio = _edge_fade(values, sample_rate, 5.0)
-        anchor = _detect_s1_anchor(cycle_audio, sample_rate)
-        pooled_cycles.append(
-            HeartbeatCycle(
-                audio=cycle_audio,
-                anchor_offset_samples=anchor,
-                active_samples=_active_cycle_samples(cycle_audio, sample_rate, anchor),
-                source_cycle_index=int(item.get("source_cycle_index", fallback_index)),
-                quality_score=float(item.get("quality_score", 0.0)),
-            )
+    best_loop_artifact = result.get("artifacts", {}).get(
+        "cleanest_heartbeat_loop.wav"
+    )
+    if best_loop_artifact:
+        best_loop, artifact_rate = sf.read(
+            io.BytesIO(best_loop_artifact),
+            dtype="float32",
+            always_2d=True,
         )
-    if pooled_cycles:
-        requested = max(1, int(requested_cycles or len(pooled_cycles)))
-        if len(pooled_cycles) > requested:
-            pooled_cycles.sort(key=lambda cycle: cycle.source_cycle_index)
-            contiguous = [
-                pooled_cycles[index : index + requested]
-                for index in range(len(pooled_cycles) - requested + 1)
-                if np.all(
-                    np.diff(
-                        [
-                            cycle.source_cycle_index
-                            for cycle in pooled_cycles[index : index + requested]
-                        ]
-                    )
-                    == 1
-                )
-            ]
-            if contiguous:
-                pooled_cycles = max(
-                    contiguous,
-                    key=lambda window: float(
-                        np.mean([cycle.quality_score for cycle in window])
-                    ),
-                )
-            else:
-                pooled_cycles = sorted(
-                    pooled_cycles,
-                    key=lambda cycle: cycle.quality_score,
-                    reverse=True,
-                )[:requested]
-                pooled_cycles.sort(key=lambda cycle: cycle.source_cycle_index)
-        return pooled_cycles, sample_rate
-
-    audio = np.asarray(result["cleanest_audio"], dtype=np.float32)
+        if int(artifact_rate) != sample_rate:
+            best_loop = resample_audio(best_loop, int(artifact_rate), sample_rate)
+        audio = np.mean(best_loop, axis=1, dtype=np.float32)
+    else:
+        audio = np.asarray(result["cleanest_audio"], dtype=np.float32)
     segment = result["cleanest_segment"]
     start = float(segment["adjusted_start_seconds"])
     end = float(segment["adjusted_end_seconds"])
@@ -1803,6 +1765,15 @@ def extract_heartbeat_cycles(
                     source_cycle_index=cycle_index,
                 )
             )
+    anchor_limit = int(round(0.25 * sample_rate))
+    well_anchored = [
+        cycle
+        for cycle in cycles
+        if cycle.anchor_offset_samples
+        <= min(anchor_limit, max(1, int(round(0.45 * len(cycle.audio)))))
+    ]
+    if well_anchored:
+        cycles = well_anchored
     if not cycles:
         raise ValueError("No usable heartbeat cycle was found in the selected clean loop.")
     if requested_cycles is not None:

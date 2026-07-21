@@ -95,7 +95,8 @@ class HeartbeatDenoisingTest(unittest.TestCase):
         self.assertLess(quiet_change_db, -2.0)
         self.assertGreater(heart_change_db, quiet_change_db + 1.0)
         self.assertGreater(len(result["cycle_pool"]), 4)
-        self.assertIn("heartbeat_cycle_pool_preview.wav", result["artifacts"])
+        self.assertNotIn("heartbeat_cycle_pool_preview.wav", result["artifacts"])
+        self.assertIn("cleanest_heartbeat_loop.wav", result["artifacts"])
 
     def test_rejects_audio_over_configured_duration_limit(self) -> None:
         sr = 8000

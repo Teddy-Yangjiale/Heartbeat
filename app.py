@@ -78,7 +78,6 @@ def compact_heartbeat_result(result: dict) -> dict:
         "input_reference.wav",
         "cleaned.wav",
         "cleanest_heartbeat_loop.wav",
-        "heartbeat_cycle_pool_preview.wav",
         "heartbeat_detection_mix.wav",
     }
     return {
@@ -91,7 +90,6 @@ def compact_heartbeat_result(result: dict) -> dict:
             "recording_quality",
             "cleanest_segment",
             "cleanest_audio",
-            "cycle_pool",
             "s1_times",
             "s2_times",
         )
@@ -384,12 +382,12 @@ def show_analysis(heartbeat_result: dict, song_analysis: dict) -> None:
     left.audio(heartbeat_result["artifacts"]["input_reference.wav"], format="audio/wav")
     middle.write("预处理后心跳")
     middle.audio(heartbeat_result["artifacts"]["cleaned.wav"], format="audio/wav")
-    right.write("送入音乐处理器的多周期真实素材池")
-    pool_preview = heartbeat_result["artifacts"].get(
-        "heartbeat_cycle_pool_preview.wav",
+    right.write("送入音乐处理器的最佳心跳循环")
+    right.audio(
         heartbeat_result["artifacts"]["cleanest_heartbeat_loop.wav"],
+        format="audio/wav",
     )
-    right.audio(pool_preview, format="audio/wav")
+    right.caption("直接截取自 cleaned.wav；不使用增响版，也不再使用多周期素材池。")
     diagnostic.write("S1/S2 检测检查轨")
     diagnostic.audio(
         heartbeat_result["artifacts"]["heartbeat_detection_mix.wav"],
@@ -813,8 +811,8 @@ def main() -> None:
         )
         contract = st.columns(4)
         beats_per_loop = contract[0].number_input(
-            "每个心跳循环包含周期数", 1, 16, 4, 1,
-            help="从质量最好的连续真实心跳周期中选取循环素材。",
+            "从最佳循环使用的周期数", 1, 16, 4, 1,
+            help="只在 cleanest_heartbeat_loop.wav 内部切分周期，不从多周期素材池取音频。",
         )
         intro_pulses = contract[1].number_input("歌曲前心跳次数", 0, 16, 4, 1)
         outro_pulses = contract[2].number_input("歌曲后心跳次数", 0, 16, 4, 1)
@@ -969,13 +967,13 @@ def main() -> None:
                         job_path = Path(output_dir)
                         input_path = job_path / "inputs"
                         input_path.mkdir(parents=True, exist_ok=True)
-                        heartbeat_path = input_path / "heartbeat_cleaned.wav"
+                        heartbeat_path = input_path / "heartbeat_best_loop.wav"
                         song_suffix = Path(song_upload.name).suffix.lower()
                         if song_suffix not in {".wav", ".mp3"}:
                             song_suffix = ".wav"
                         song_path = input_path / f"song{song_suffix}"
                         heartbeat_path.write_bytes(
-                            heartbeat_result["artifacts"]["cleaned.wav"]
+                            heartbeat_result["artifacts"]["cleanest_heartbeat_loop.wav"]
                         )
                         song_path.write_bytes(bytes(song_data))
                         sync_output_root = job_path / "heartbeat_sync_outputs"

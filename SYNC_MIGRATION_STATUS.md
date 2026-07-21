@@ -9,7 +9,7 @@
 | `auto/cpu/cuda` | 参数透传 | CPU | CLI 命令数组测试 |
 | 混合静音裁剪 | 参数透传 | 强/保守 top-dB 双阈值与手动覆盖 | 自动/手动裁剪测试 |
 | 预览 `max_song_seconds` | 只在预览传入 | 只在预览截取 | 整首不带 45 秒上限 |
-| `beats_per_loop=4` | 参数透传 | 质量最高的连续周期窗口 | 默认值与五文件端到端测试 |
+| `beats_per_loop=4` | 把 `cleanest_heartbeat_loop.wav` 作为 CLI 心跳输入并透传周期数 | 只在最佳连续循环内部切分周期 | 素材池污染隔离与五文件端到端测试 |
 | 前后各 4 个脉冲 | 参数透传 | 平移歌曲时轴并安排 intro/outro | 片头片尾计数和最终时长测试 |
 | bar/half/normal/double/auto | 参数透传 | 兼容全部模式，并保留网页的 downbeat/kick/backbeat/局部模式 | 调度测试 |
 | 55–110 BPM 密度范围 | 参数透传 | 自适应网格约束 | 自适应节拍测试 |

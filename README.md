@@ -2,7 +2,7 @@
 
 Heartbeat Music Processor 是一个完整的心跳驱动音乐处理网页。用户上传一段心跳 WAV 和一首 WAV/MP3 歌曲，系统会自动完成：
 
-1. 自动工频抑制、心动静息相位噪声建模、节律检测、质量评估和多真实周期素材池；
+1. 自动工频抑制、心动静息相位噪声建模、节律检测、质量评估和最佳连续心跳循环选择；
 2. 歌曲 BPM、动态节拍网格、小节重拍、真实低频底鼓 onset 和局部能量分析；
 3. 检测每个心跳周期真正的 S1 onset，保留 S1/S2 有效段，并用可调吸附、微时差和 Swing 自然排布；
 4. 对指定时间区域单独调整歌曲音量、心跳音量、心跳密度和周期适配；
@@ -134,7 +134,7 @@ MP3 由 `soundfile` 随附的 `libsndfile` 直接解码，网页不依赖系统 
 | `heartbeat_detection_mix.wav` | 预处理心跳与 S1/S2 点击检查轨 |
 | `analysis_report.json` | `run` 到 `alignment` 的完整迁移报告 |
 
-心跳预处理阶段优先使用 `cycle_pool` 中最多 16 个真实周期进入混音；若旧结果没有素材池才回退到 `cleanest_heartbeat_loop.wav`。不会使用仅供手机试听的增响版本，避免重复增益和软削波。
+音乐处理阶段只使用 `cleanest_heartbeat_loop.wav`。它是从 `cleaned.wav` 中评分选出的连续真实片段；处理器只在该片段内部切分 S1 周期进行排布，不再读取 `cycle_pool`，也不会使用仅供手机试听的增响版本。
 
 ## 处理架构
 

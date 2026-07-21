@@ -271,9 +271,12 @@ def process_audio_bytes(
         "input_reference.wav": wav_bytes(sr, input_reference_audio),
         "cleaned.wav": wav_bytes(sr, cleaned_audio),
         "cleanest_heartbeat_loop.wav": wav_bytes(sr, cleanest_audio),
-        "heartbeat_cycle_pool_preview.wav": wav_bytes(sr, cycle_pool_preview),
         "heartbeat_detection_mix.wav": wav_bytes(sr, heartbeat_detection_audio),
     }
+    if artifact_profile == "full":
+        preview_artifacts["heartbeat_cycle_pool_preview.wav"] = wav_bytes(
+            sr, cycle_pool_preview
+        )
     artifacts = dict(preview_artifacts)
     if artifact_profile == "full":
         envelope_df = make_envelope_frame(envelope, sr, params.export_envelope_hz)

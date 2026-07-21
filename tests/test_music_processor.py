@@ -21,6 +21,7 @@ from music_processor.core import (
     analyze_song_bytes,
     build_adaptive_pulse_grid,
     build_region_schedule,
+    extract_heartbeat_cycles,
     fit_cycle,
     get_style_preset,
     process_music_bytes,
@@ -103,6 +104,25 @@ class MusicProcessorTests(unittest.TestCase):
         self.assertNotIn("audio", analysis)
         self.assertLessEqual(len(analysis["waveform_overview_values"]), 10000)
         self.assertGreater(len(analysis["downbeat_times_seconds"]), 1)
+
+    def test_music_input_ignores_cycle_pool_and_uses_only_best_loop(self) -> None:
+        heartbeat = dict(self.heartbeat)
+        heartbeat["cleanest_audio"] = np.zeros_like(self.heartbeat["cleanest_audio"])
+        heartbeat["cycle_pool"] = [
+            {
+                "audio": np.ones(8000, dtype=np.float32),
+                "source_cycle_index": 999,
+                "quality_score": 100.0,
+            }
+        ]
+        cycles, sample_rate = extract_heartbeat_cycles(heartbeat, requested_cycles=4)
+        self.assertEqual(sample_rate, self.heartbeat["sample_rate"])
+        self.assertGreater(len(cycles), 0)
+        self.assertTrue(all(cycle.source_cycle_index != 999 for cycle in cycles))
+        self.assertTrue(all(float(np.std(cycle.audio)) > 1e-4 for cycle in cycles))
+        self.assertTrue(
+            all(cycle.anchor_offset_samples <= int(0.25 * sample_rate) for cycle in cycles)
+        )
 
     def test_song_file_like_input_is_reused_without_losing_position(self) -> None:
         source = io.BytesIO(self.song_bytes)
